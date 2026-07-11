@@ -43,9 +43,6 @@ cd "$REPO_DIR"
 echo "==> Installing dependencies..."
 pip install -q -r requirements.txt
 
-echo "==> Authenticating with HuggingFace..."
-huggingface-cli login --token "$HF_TOKEN" --add-to-git-credential > /dev/null
-
 if [ ! -f "data/processed/train_manifest.json" ]; then
   echo "==> Downloading processed dataset..."
   python download_processed.py
