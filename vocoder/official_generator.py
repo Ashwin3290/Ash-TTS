@@ -115,6 +115,17 @@ class AttrDict(dict):
         self.__dict__ = self
 
 
+def config_from_hcfg(hcfg):
+    """Build the AttrDict Generator(h) expects from our config.hifigan dataclass."""
+    return AttrDict({
+        "resblock_kernel_sizes":    hcfg.resblock_kernel_sizes,
+        "resblock_dilation_sizes":  hcfg.resblock_dilation_sizes,
+        "upsample_rates":           hcfg.upsample_rates,
+        "upsample_kernel_sizes":    hcfg.upsample_kernel_sizes,
+        "upsample_initial_channel": hcfg.upsample_initial_channels,
+    })
+
+
 def load_pretrained_generator(ckpt_path, config_path, device):
     """
     Load an official HiFi-GAN generator checkpoint (e.g. generator_v1 /

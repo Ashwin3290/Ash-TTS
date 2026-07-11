@@ -12,6 +12,17 @@ Usage:
     python train_hifigan.py
     python train_hifigan.py --resume-g checkpoints/hifigan/g_step_50000.pt \
                              --resume-d checkpoints/hifigan/d_step_50000.pt
+
+    # fine-tune from the official pretrained checkpoint instead of from scratch
+    # (model weights only — fresh optimiser/scheduler/step count, i.e. a real
+    # continued-training run, not a resume of someone else's training state)
+    python train_hifigan.py --init-g pretrained_hifigan/generator_v1 \
+                             --init-d pretrained_hifigan/do_v1
+
+Uses the official jik876/hifi-gan Generator architecture (vocoder/official_generator.py)
+so pretrained checkpoints load directly — see that module's docstring for why the
+in-repo vocoder/generator.py can't load them as-is (different resblock grouping).
+MPD/MSD in vocoder/discriminator.py already match the official layout exactly.
 """
 
 import os
@@ -26,7 +37,7 @@ from pathlib import Path
 from tqdm import tqdm
 
 from config import hifigan as hcfg, audio as acfg, paths
-from vocoder.generator      import Generator
+from vocoder.official_generator import Generator, config_from_hcfg
 from vocoder.discriminator  import MPD, MSD
 from vocoder.losses         import (discriminator_loss, generator_adversarial_loss,
                                     feature_matching_loss, mel_reconstruction_loss)
@@ -100,7 +111,7 @@ def get_mel_fn(device):
     return mel_fn
 
 
-def train(resume_g=None, resume_d=None):
+def train(resume_g=None, resume_d=None, init_g=None, init_d=None):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
 
@@ -121,7 +132,7 @@ def train(resume_g=None, resume_d=None):
     )
     print(f"Train batches: {len(train_loader)}")
 
-    generator = Generator().to(device)
+    generator = Generator(config_from_hcfg(hcfg)).to(device)
     mpd = MPD().to(device)
     msd = MSD().to(device)
 
@@ -142,6 +153,7 @@ def train(resume_g=None, resume_d=None):
 
     start_step = 0
     if resume_g:
+        # resuming our own training run — restore optimiser/scheduler/step too
         ckpt = torch.load(resume_g, map_location=device)
         generator.load_state_dict(ckpt["generator"])
         opt_g.load_state_dict(ckpt["opt_g"])
@@ -150,6 +162,14 @@ def train(resume_g=None, resume_d=None):
             scaler_g.load_state_dict(ckpt["scaler_g"])
         start_step = ckpt.get("step", 0)
         print(f"Resumed generator from step {start_step}")
+    elif init_g:
+        # fine-tuning from an external pretrained checkpoint — weights only,
+        # optimiser/scheduler/step start fresh since this is new training, not
+        # a resume of that checkpoint's own (incompatible) training state
+        ckpt = torch.load(init_g, map_location=device)
+        generator.load_state_dict(ckpt["generator"])
+        print(f"Initialised generator from pretrained checkpoint: {init_g}")
+
     if resume_d:
         ckpt = torch.load(resume_d, map_location=device)
         mpd.load_state_dict(ckpt["mpd"])
@@ -158,6 +178,11 @@ def train(resume_g=None, resume_d=None):
         sched_d.load_state_dict(ckpt["sched_d"])
         if "scaler_d" in ckpt:
             scaler_d.load_state_dict(ckpt["scaler_d"])
+    elif init_d:
+        ckpt = torch.load(init_d, map_location=device)
+        mpd.load_state_dict(ckpt["mpd"])
+        msd.load_state_dict(ckpt["msd"])
+        print(f"Initialised discriminators from pretrained checkpoint: {init_d}")
 
     mel_fn = get_mel_fn(device)
     step = start_step
@@ -258,6 +283,12 @@ if __name__ == "__main__":
                         help="Resume from g_latest.pt / d_latest.pt")
     parser.add_argument("--resume-g", default=None)
     parser.add_argument("--resume-d", default=None)
+    parser.add_argument("--init-g", default=None,
+                        help="Path to official pretrained generator checkpoint "
+                             "(e.g. generator_v1) to fine-tune from")
+    parser.add_argument("--init-d", default=None,
+                        help="Path to official pretrained discriminator checkpoint "
+                             "(e.g. do_v1) to fine-tune from")
     args = parser.parse_args()
 
     if args.resume == "auto" and not (args.resume_g or args.resume_d):
@@ -272,4 +303,5 @@ if __name__ == "__main__":
         if not g_latest.exists():
             print("No g_latest.pt found, starting fresh.")
 
-    train(resume_g=args.resume_g, resume_d=args.resume_d)
+    train(resume_g=args.resume_g, resume_d=args.resume_d,
+          init_g=args.init_g, init_d=args.init_d)

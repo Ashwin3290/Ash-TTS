@@ -73,7 +73,9 @@ class HiFiGANConfig:
     # generator
     upsample_rates: list = field(default_factory=lambda: [8, 8, 2, 2])      # product must = hop_length (256)
     upsample_kernel_sizes: list = field(default_factory=lambda: [16, 16, 4, 4])
-    upsample_initial_channels: int = 128
+    # must be 512 to match jik876/hifi-gan's official generator_v1 checkpoint —
+    # we're fine-tuning from it, so architecture width can't be shrunk for VRAM
+    upsample_initial_channels: int = 512
     resblock_kernel_sizes: list = field(default_factory=lambda: [3, 7, 11])
     resblock_dilation_sizes: list = field(default_factory=lambda: [[1,3,5], [1,3,5], [1,3,5]])
 
