@@ -146,13 +146,18 @@ def train(resume_g=None, resume_d=None):
         generator.load_state_dict(ckpt["generator"])
         opt_g.load_state_dict(ckpt["opt_g"])
         sched_g.load_state_dict(ckpt["sched_g"])
+        if "scaler_g" in ckpt:
+            scaler_g.load_state_dict(ckpt["scaler_g"])
         start_step = ckpt.get("step", 0)
+        print(f"Resumed generator from step {start_step}")
     if resume_d:
         ckpt = torch.load(resume_d, map_location=device)
         mpd.load_state_dict(ckpt["mpd"])
         msd.load_state_dict(ckpt["msd"])
         opt_d.load_state_dict(ckpt["opt_d"])
         sched_d.load_state_dict(ckpt["sched_d"])
+        if "scaler_d" in ckpt:
+            scaler_d.load_state_dict(ckpt["scaler_d"])
 
     mel_fn = get_mel_fn(device)
     step = start_step
@@ -218,19 +223,29 @@ def train(resume_g=None, resume_d=None):
         if (step + 1) % hcfg.save_every == 0:
             g_path = paths.hifigan_ckpt_dir / f"g_step_{step+1}.pt"
             d_path = paths.hifigan_ckpt_dir / f"d_step_{step+1}.pt"
-            torch.save({
+            g_state = {
                 "step": step + 1,
                 "generator": generator.state_dict(),
                 "opt_g": opt_g.state_dict(),
                 "sched_g": sched_g.state_dict(),
-            }, g_path)
-            torch.save({
+                "scaler_g": scaler_g.state_dict(),
+            }
+            d_state = {
+                "step": step + 1,
                 "mpd": mpd.state_dict(),
                 "msd": msd.state_dict(),
                 "opt_d": opt_d.state_dict(),
                 "sched_d": sched_d.state_dict(),
-            }, d_path)
-            print(f"\nSaved: {g_path.name}, {d_path.name}")
+                "scaler_d": scaler_d.state_dict(),
+            }
+            torch.save(g_state, g_path)
+            torch.save(d_state, d_path)
+            # atomic latest checkpoints for --resume auto
+            for state, name in ((g_state, "g_latest.pt"), (d_state, "d_latest.pt")):
+                tmp = paths.hifigan_ckpt_dir / f"{name}.tmp"
+                torch.save(state, tmp)
+                tmp.replace(paths.hifigan_ckpt_dir / name)
+            print(f"\nSaved: {g_path.name}, {d_path.name}  (g_latest/d_latest updated)")
 
     print("HiFi-GAN training complete.")
 
@@ -239,7 +254,22 @@ if __name__ == "__main__":
     import multiprocessing
     multiprocessing.freeze_support()
     parser = argparse.ArgumentParser()
+    parser.add_argument("--resume", nargs="?", const="auto", default=None,
+                        help="Resume from g_latest.pt / d_latest.pt")
     parser.add_argument("--resume-g", default=None)
     parser.add_argument("--resume-d", default=None)
     args = parser.parse_args()
+
+    if args.resume == "auto" and not (args.resume_g or args.resume_d):
+        g_latest = paths.hifigan_ckpt_dir / "g_latest.pt"
+        d_latest = paths.hifigan_ckpt_dir / "d_latest.pt"
+        if g_latest.exists():
+            args.resume_g = str(g_latest)
+            print(f"Auto-resuming generator from {g_latest}")
+        if d_latest.exists():
+            args.resume_d = str(d_latest)
+            print(f"Auto-resuming discriminators from {d_latest}")
+        if not g_latest.exists():
+            print("No g_latest.pt found, starting fresh.")
+
     train(resume_g=args.resume_g, resume_d=args.resume_d)

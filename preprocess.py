@@ -87,8 +87,10 @@ def extract_mel(wav, sr):
 def extract_f0_parselmouth(wav, sr, n_frames):
     """Fast F0 via Praat. ~5-10x faster than pyin."""
     snd   = parselmouth.Sound(wav, sampling_frequency=sr)
+    # ceiling 600 Hz: speech range for a female speaker — a music-range ceiling
+    # (e.g. 2093 Hz) makes Praat track harmonics, inflating f0 stats ~5x
     pitch = snd.to_pitch(time_step=acfg.hop_length / sr,
-                         pitch_floor=65.0, pitch_ceiling=2093.0)
+                         pitch_floor=65.0, pitch_ceiling=600.0)
     xs    = pitch.xs()
     f0    = np.array([pitch.get_value_at_time(t) for t in xs], dtype=np.float32)
     f0    = np.nan_to_num(f0, nan=0.0)

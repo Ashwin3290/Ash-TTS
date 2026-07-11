@@ -55,7 +55,7 @@ class TrainFastSpeechConfig:
     warmup_steps: int = 1000
     max_steps: int = 300_000
     grad_clip: float = 0.5
-    fp16: bool = False
+    fp16: bool = True
 
     # loss weights
     mel_loss_weight: float = 1.0

@@ -138,6 +138,14 @@ def align_utterance(wav_path, text, n_phones, model, device, backend):
             word_start[i] = prev_end
             word_end[i]   = prev_end + 1
 
+    # bridge inter-word gaps and head/tail silence: MMS-FA spans are tight
+    # around speech, so pauses (~30% of frames on LJSpeech) would otherwise be
+    # assigned to no phoneme and the duration/mel timelines drift apart
+    word_start[0] = 0
+    for i in range(n_words - 1):
+        word_end[i] = word_start[i + 1]
+    word_end[-1] = emissions.size(1)
+
     # phonemize each word to get phone count per word
     word_phones = phonemize_words(words, backend)
 

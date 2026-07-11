@@ -29,6 +29,15 @@ class LJSpeechDataset(Dataset):
         with open(manifest_path) as f:
             self.manifest = json.load(f)
 
+        # drop utterances without a duration file — the old zeros fallback fed
+        # all-zero ground-truth durations to the model, silently corrupting training
+        n_before = len(self.manifest)
+        self.manifest = [m for m in self.manifest
+                         if (self.processed_dir / "duration" / f"{m['id']}.npy").exists()]
+        if len(self.manifest) < n_before:
+            print(f"WARNING: dropped {n_before - len(self.manifest)} utterances "
+                  f"without duration files ({len(self.manifest)} remain)")
+
         # load normalisation stats for pitch and energy
         stats_path = self.processed_dir / "stats.json"
         if stats is not None:
@@ -65,8 +74,7 @@ class LJSpeechDataset(Dataset):
         f0     = self._normalise_f0(f0)
         energy = self._normalise_energy(energy)
 
-        dur_path = self.processed_dir / "duration" / f"{utt_id}.npy"
-        durations = np.load(dur_path) if dur_path.exists() else np.zeros(len(phonemes), dtype=np.int32)
+        durations = np.load(self.processed_dir / "duration" / f"{utt_id}.npy")
 
         return {
             "id": utt_id,
@@ -131,8 +139,8 @@ def get_loaders(processed_dir=None, batch_size=None):
     val_ds   = LJSpeechDataset(processed_dir / "val_manifest.json",   processed_dir,
                                 stats=train_ds.stats)
 
-    num_workers = 6
-    val_workers = 4
+    num_workers = min(6, os.cpu_count() or 2)
+    val_workers = min(4, os.cpu_count() or 2)
 
     train_loader = DataLoader(
         train_ds,
@@ -142,6 +150,7 @@ def get_loaders(processed_dir=None, batch_size=None):
         num_workers=num_workers,
         pin_memory=True,
         drop_last=True,
+        persistent_workers=num_workers > 0,
     )
     val_loader = DataLoader(
         val_ds,
@@ -150,5 +159,6 @@ def get_loaders(processed_dir=None, batch_size=None):
         collate_fn=collate_fn,
         num_workers=val_workers,
         pin_memory=True,
+        persistent_workers=val_workers > 0,
     )
     return train_loader, val_loader

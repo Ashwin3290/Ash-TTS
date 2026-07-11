@@ -6,10 +6,18 @@ Requires:
   - Trained HiFi-GAN generator checkpoint
 
 Usage:
+    # your own self-trained HiFi-GAN (normalised [-1,1] mel, no denorm)
     python inference.py --text "Hello, this is a test." \
                         --fs2-ckpt checkpoints/fastspeech2/step_300000.pt \
                         --hifi-ckpt checkpoints/hifigan/g_step_500000.pt \
                         --output output.wav
+
+    # official pretrained HiFi-GAN (generator_v1 / universal_v1) — needs the
+    # raw natural-log mel scale, so this path denormalises before vocoding
+    python inference.py --text "Hello, this is a test." \
+                        --fs2-ckpt checkpoints/fastspeech2/step_300000.pt \
+                        --hifi-ckpt generator_v1 --hifi-config config.json \
+                        --pretrained-hifigan --output output.wav
 
 Optional control knobs (all default 1.0):
     --speed   0.8   # slower speech
@@ -42,11 +50,14 @@ def load_phoneme_vocab():
 
 def text_to_phonemes(text, vocab):
     try:
-        from phonemizer import phonemize
         from phonemizer.backend import EspeakBackend
+        from phonemizer.separator import Separator
         backend = EspeakBackend("en-us", preserve_punctuation=False, with_stress=True)
-        ph_str = backend.phonemize([text], separator=None)[0]
-        phonemes = [vocab.get(p, vocab.get("<pad>", 0)) for p in ph_str.split()]
+        # must match preprocess.py exactly: phone-level tokens, word marker stripped
+        sep = Separator(phone=' ', word='| ', syllable='')
+        ph_str = backend.phonemize([text], separator=sep)[0]
+        phonemes = [vocab.get(p, vocab.get("<pad>", 0))
+                    for p in ph_str.replace('|', '').split() if p.strip()]
     except ImportError:
         print("WARNING: phonemizer not available, falling back to character-level")
         phonemes = [vocab.get(c, vocab.get("<pad>", 0)) for c in text]
@@ -62,7 +73,8 @@ def mel_to_wav(mel, generator, device):
 
 
 def infer(text, fs2_ckpt, hifi_ckpt, output_path,
-          speed=1.0, pitch=1.0, energy=1.0):
+          speed=1.0, pitch=1.0, energy=1.0,
+          pretrained_hifigan=False, hifi_config=None):
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
@@ -80,11 +92,17 @@ def infer(text, fs2_ckpt, hifi_ckpt, output_path,
     fs2.eval()
 
     # load HiFi-GAN generator
-    hifi = Generator().to(device)
-    hifi_ckpt_data = torch.load(hifi_ckpt, map_location=device)
-    hifi.load_state_dict(hifi_ckpt_data["generator"])
-    hifi.eval()
-    hifi.remove_weight_norm()   # fuse weight norm for faster inference
+    if pretrained_hifigan:
+        if not hifi_config:
+            raise ValueError("--hifi-config is required with --pretrained-hifigan")
+        from vocoder.official_generator import load_pretrained_generator
+        hifi = load_pretrained_generator(hifi_ckpt, hifi_config, device)
+    else:
+        hifi = Generator().to(device)
+        hifi_ckpt_data = torch.load(hifi_ckpt, map_location=device)
+        hifi.load_state_dict(hifi_ckpt_data["generator"])
+        hifi.eval()
+        hifi.remove_weight_norm()   # fuse weight norm for faster inference
 
     # run FastSpeech2
     ph_tensor  = torch.tensor(phonemes, dtype=torch.long).unsqueeze(0).to(device)  # (1, L)
@@ -101,8 +119,12 @@ def infer(text, fs2_ckpt, hifi_ckpt, output_path,
     mel = mel_pred[0, :mel_lens[0].item()].cpu().numpy()  # (T, 80)
     print(f"Mel frames: {mel.shape[0]}  ({mel.shape[0] * acfg.hop_length / acfg.sample_rate:.2f}s)")
 
-    # denormalize mel from [-1, 1] back to log scale
-    mel = (mel + 1) / 2 * (acfg.mel_max - acfg.mel_min) + acfg.mel_min
+    if pretrained_hifigan:
+        # official HiFi-GAN expects raw natural-log mel, not our [-1,1]
+        # normalised training scale — denormalise back before vocoding
+        mel = (mel + 1) / 2 * (acfg.mel_max - acfg.mel_min) + acfg.mel_min
+    # else: self-trained HiFi-GAN was trained on the same normalised mels
+    # FastSpeech2 predicts, so no denorm needed here.
 
     # run HiFi-GAN
     wav = mel_to_wav(mel, hifi, device)
@@ -119,6 +141,11 @@ if __name__ == "__main__":
     parser.add_argument("--text",      required=True)
     parser.add_argument("--fs2-ckpt",  required=True)
     parser.add_argument("--hifi-ckpt", required=True)
+    parser.add_argument("--hifi-config", default=None,
+                        help="Required with --pretrained-hifigan (official config.json)")
+    parser.add_argument("--pretrained-hifigan", action="store_true",
+                        help="Load an official jik876/hifi-gan checkpoint instead of "
+                             "our self-trained vocoder")
     parser.add_argument("--output",    default="output.wav")
     parser.add_argument("--speed",     type=float, default=1.0)
     parser.add_argument("--pitch",     type=float, default=1.0)
@@ -133,4 +160,6 @@ if __name__ == "__main__":
         speed=args.speed,
         pitch=args.pitch,
         energy=args.energy,
+        pretrained_hifigan=args.pretrained_hifigan,
+        hifi_config=args.hifi_config,
     )

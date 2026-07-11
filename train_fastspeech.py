@@ -12,6 +12,7 @@ Usage:
 
 import argparse
 import json
+import os
 import torch
 import torch.nn.functional as F
 from torch.amp import GradScaler, autocast
@@ -41,8 +42,25 @@ def save_checkpoint(step, model, optimizer, scheduler, scaler, ckpt_dir):
     }
     ckpt_path = ckpt_dir / f"step_{step}.pt"
     torch.save(state, ckpt_path)
-    # always overwrite latest.pt for easy resume
-    torch.save(state, ckpt_dir / "latest.pt")
+    # write latest.pt atomically — a crash mid-save must not corrupt the resume point
+    tmp = ckpt_dir / "latest.pt.tmp"
+    torch.save(state, tmp)
+    tmp.replace(ckpt_dir / "latest.pt")
+
+    # optional off-machine backup: set HF_CKPT_REPO to push latest.pt to HuggingFace
+    # (needed on Kaggle/RunPod where the filesystem dies with the session)
+    repo = os.environ.get("HF_CKPT_REPO")
+    if repo:
+        try:
+            from huggingface_hub import HfApi
+            HfApi().upload_file(
+                path_or_fileobj=str(ckpt_dir / "latest.pt"),
+                path_in_repo="latest.pt",
+                repo_id=repo, repo_type="model",
+            )
+        except Exception as e:
+            print(f"\nHF checkpoint upload failed (continuing): {e}")
+
     return ckpt_path
 
 
