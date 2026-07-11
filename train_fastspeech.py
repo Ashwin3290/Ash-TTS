@@ -16,6 +16,7 @@ import os
 import torch
 import torch.nn.functional as F
 from torch.amp import GradScaler, autocast
+from torch.utils.tensorboard import SummaryWriter
 from pathlib import Path
 from tqdm import tqdm
 
@@ -90,6 +91,7 @@ def train(resume_path=None):
         print(f"VRAM: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
 
     paths.make_dirs()
+    writer = SummaryWriter(log_dir=str(paths.log_dir / "fastspeech2"))
 
     train_loader, val_loader = get_loaders()
     print(f"Train batches: {len(train_loader)}  Val batches: {len(val_loader)}")
@@ -176,6 +178,12 @@ def train(resume_path=None):
                 "dur":  f"{loss_dur.item():.3f}",
                 "lr":   f"{optimizer.param_groups[0]['lr']:.2e}",
             })
+            writer.add_scalar("train/loss",   avg_loss,           step + 1)
+            writer.add_scalar("train/mel",    loss_mel.item(),    step + 1)
+            writer.add_scalar("train/dur",    loss_dur.item(),    step + 1)
+            writer.add_scalar("train/pitch",  loss_pitch.item(),  step + 1)
+            writer.add_scalar("train/energy", loss_energy.item(), step + 1)
+            writer.add_scalar("train/lr",     optimizer.param_groups[0]["lr"], step + 1)
             running_loss = 0.0
 
         if (step + 1) % tcfg.val_every == 0:
@@ -196,7 +204,9 @@ def train(resume_path=None):
                         T     = min(vmel_pred.size(1), vmel.size(1))
                         vloss = masked_mse(vmel_pred[:, :T], vmel[:, :T], vmell.clamp(max=T))
                     val_losses.append(vloss.item())
-            print(f"\n[step {step+1}] val mel loss: {sum(val_losses)/len(val_losses):.4f}")
+            val_mel_loss = sum(val_losses) / len(val_losses)
+            print(f"\n[step {step+1}] val mel loss: {val_mel_loss:.4f}")
+            writer.add_scalar("val/mel_loss", val_mel_loss, step + 1)
             model.train()
 
         if (step + 1) % SAVE_EVERY == 0:
@@ -206,6 +216,7 @@ def train(resume_path=None):
             )
             print(f"\nSaved: {ckpt_path.name}  (latest.pt updated)")
 
+    writer.close()
     print("FastSpeech2 training complete.")
 
 

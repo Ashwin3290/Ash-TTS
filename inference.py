@@ -36,7 +36,7 @@ from pathlib import Path
 
 from config import audio as acfg, model as mcfg, hifigan as hcfg, paths
 from model.fastspeech2 import FastSpeech2
-from vocoder.official_generator import Generator, config_from_hcfg
+from vocoder.generator import Generator, config_from_hcfg
 
 
 def load_phoneme_vocab():
@@ -97,7 +97,7 @@ def infer(text, fs2_ckpt, hifi_ckpt, output_path,
     if raw_official_hifigan:
         if not hifi_config:
             raise ValueError("--hifi-config is required with --raw-official-hifigan")
-        from vocoder.official_generator import load_pretrained_generator
+        from vocoder.generator import load_pretrained_generator
         hifi = load_pretrained_generator(hifi_ckpt, hifi_config, device)
     else:
         hifi = Generator(config_from_hcfg(hcfg)).to(device)

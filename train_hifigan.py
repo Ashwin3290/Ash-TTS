@@ -19,10 +19,9 @@ Usage:
     python train_hifigan.py --init-g pretrained_hifigan/generator_v1 \
                              --init-d pretrained_hifigan/do_v1
 
-Uses the official jik876/hifi-gan Generator architecture (vocoder/official_generator.py)
-so pretrained checkpoints load directly — see that module's docstring for why the
-in-repo vocoder/generator.py can't load them as-is (different resblock grouping).
-MPD/MSD in vocoder/discriminator.py already match the official layout exactly.
+Uses the official jik876/hifi-gan Generator architecture (vocoder/generator.py)
+so pretrained checkpoints load directly. MPD/MSD in vocoder/discriminator.py
+already match the official layout exactly.
 """
 
 import os
@@ -33,11 +32,12 @@ import librosa
 import numpy as np
 from torch.cuda.amp import GradScaler, autocast
 from torch.utils.data import Dataset, DataLoader
+from torch.utils.tensorboard import SummaryWriter
 from pathlib import Path
 from tqdm import tqdm
 
 from config import hifigan as hcfg, audio as acfg, paths
-from vocoder.official_generator import Generator, config_from_hcfg
+from vocoder.generator import Generator, config_from_hcfg
 from vocoder.discriminator  import MPD, MSD
 from vocoder.losses         import (discriminator_loss, generator_adversarial_loss,
                                     feature_matching_loss, mel_reconstruction_loss)
@@ -116,6 +116,7 @@ def train(resume_g=None, resume_d=None, init_g=None, init_d=None):
     print(f"Device: {device}")
 
     paths.make_dirs()
+    writer = SummaryWriter(log_dir=str(paths.log_dir / "hifigan"))
 
     train_ds = WavMelDataset(
         paths.processed_dir / "train_manifest.json",
@@ -244,6 +245,12 @@ def train(resume_g=None, resume_d=None, init_g=None, init_d=None):
                 "mel": f"{loss_mel.item():.4f}",
                 "fm":  f"{loss_fm.item():.3f}",
             })
+            writer.add_scalar("train/g_loss",   g_loss.item(),   step + 1)
+            writer.add_scalar("train/d_loss",   d_loss.item(),   step + 1)
+            writer.add_scalar("train/mel_loss", loss_mel.item(), step + 1)
+            writer.add_scalar("train/fm_loss",  loss_fm.item(),  step + 1)
+            writer.add_scalar("train/adv_loss", loss_adv.item(), step + 1)
+            writer.add_scalar("train/lr_g", opt_g.param_groups[0]["lr"], step + 1)
 
         if (step + 1) % hcfg.save_every == 0:
             g_path = paths.hifigan_ckpt_dir / f"g_step_{step+1}.pt"
@@ -272,6 +279,23 @@ def train(resume_g=None, resume_d=None, init_g=None, init_d=None):
                 tmp.replace(paths.hifigan_ckpt_dir / name)
             print(f"\nSaved: {g_path.name}, {d_path.name}  (g_latest/d_latest updated)")
 
+            # optional off-machine backup — set HF_HIFIGAN_CKPT_REPO to push
+            # g_latest.pt/d_latest.pt to HuggingFace (ephemeral cloud instances)
+            repo = os.environ.get("HF_HIFIGAN_CKPT_REPO")
+            if repo:
+                try:
+                    from huggingface_hub import HfApi
+                    api = HfApi()
+                    for name in ("g_latest.pt", "d_latest.pt"):
+                        api.upload_file(
+                            path_or_fileobj=str(paths.hifigan_ckpt_dir / name),
+                            path_in_repo=name,
+                            repo_id=repo, repo_type="model",
+                        )
+                except Exception as e:
+                    print(f"\nHF checkpoint upload failed (continuing): {e}")
+
+    writer.close()
     print("HiFi-GAN training complete.")
 
 
