@@ -189,18 +189,26 @@ def train(resume_path=None):
         # parameters instead of erroring. Only restore optimizer state when
         # the shape actually matches; otherwise start it fresh.
         saved_opt = ckpt["optimizer"]
-        if len(saved_opt["param_groups"]) == len(optimizer.param_groups):
+        structure_matches = len(saved_opt["param_groups"]) == len(optimizer.param_groups)
+        if structure_matches:
             optimizer.load_state_dict(saved_opt)
             # override the saved weight_decay so a config change takes effect
             # on resume — group 0 = decay params, group 1 = no-decay (fixed
             # order from build_optimizer)
             optimizer.param_groups[0]["weight_decay"] = tcfg.weight_decay
             optimizer.param_groups[1]["weight_decay"] = 0.0
+            scheduler.load_state_dict(ckpt["scheduler"])
         else:
             print(f"Optimizer structure changed ({len(saved_opt['param_groups'])} -> "
                   f"{len(optimizer.param_groups)} param groups) — starting fresh "
                   f"optimizer state (model weights still restored normally).")
-        scheduler.load_state_dict(ckpt["scheduler"])
+            # scheduler.load_state_dict would hit the same positional mismatch
+            # (LambdaLR's base_lrs is sized to the OLD param_group count) — skip
+            # it and manually fast-forward the scheduler/optimizer LR instead
+            resume_step = ckpt["step"]
+            scheduler.last_epoch = resume_step
+            for group in optimizer.param_groups:
+                group["lr"] = get_lr(resume_step)
         if "scaler" in ckpt:
             scaler.load_state_dict(ckpt["scaler"])
         if ckpt.get("best_val_loss") is not None:
