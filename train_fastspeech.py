@@ -79,21 +79,30 @@ def save_checkpoint(step, model, optimizer, scheduler, scaler, ckpt_dir,
         try:
             from huggingface_hub import HfApi
             api = HfApi()
+            # delete before re-uploading — an in-place overwrite still leaves
+            # the old chunk data retained by HF's storage backend even after
+            # squashing history, so an explicit delete is needed to actually
+            # release it (squash_history() alone was seen to leave ~7GB behind
+            # despite only ~1GB of files being visible)
+            try:
+                api.delete_file("latest.pt", repo_id=repo, repo_type="model")
+            except Exception:
+                pass  # first push ever — nothing to delete yet
             api.upload_file(
                 path_or_fileobj=str(ckpt_dir / "latest.pt"),
                 path_in_repo="latest.pt",
                 repo_id=repo, repo_type="model",
             )
             if is_best:
+                try:
+                    api.delete_file("best.pt", repo_id=repo, repo_type="model")
+                except Exception:
+                    pass
                 api.upload_file(
                     path_or_fileobj=str(ckpt_dir / "best.pt"),
                     path_in_repo="best.pt",
                     repo_id=repo, repo_type="model",
                 )
-            # squash git history after every push — each overwrite of the same
-            # path otherwise keeps the old blob in history forever, silently
-            # burning through the account's private storage quota over
-            # hundreds of pushes until every future upload starts failing
             api.super_squash_history(repo, repo_type="model")
         except Exception as e:
             print(f"\nHF checkpoint upload failed (continuing): {e}")

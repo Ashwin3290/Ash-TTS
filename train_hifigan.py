@@ -301,15 +301,19 @@ def train(resume_g=None, resume_d=None, init_g=None, init_d=None):
                 try:
                     from huggingface_hub import HfApi
                     api = HfApi()
+                    # delete before re-uploading — see train_fastspeech.py's
+                    # save_checkpoint for why an in-place overwrite alone
+                    # isn't enough to release the old version's storage
                     for name in ("g_latest.pt", "d_latest.pt"):
+                        try:
+                            api.delete_file(name, repo_id=repo, repo_type="model")
+                        except Exception:
+                            pass
                         api.upload_file(
                             path_or_fileobj=str(paths.hifigan_ckpt_dir / name),
                             path_in_repo=name,
                             repo_id=repo, repo_type="model",
                         )
-                    # squash history after every push — see train_fastspeech.py's
-                    # save_checkpoint for why this matters (unbounded git-history
-                    # growth from repeatedly overwriting the same path)
                     api.super_squash_history(repo, repo_type="model")
                 except Exception as e:
                     print(f"\nHF checkpoint upload failed (continuing): {e}")
