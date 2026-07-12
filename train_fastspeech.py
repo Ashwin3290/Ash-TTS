@@ -34,14 +34,16 @@ def get_lr(step, d_model=mcfg.d_model, warmup=tcfg.warmup_steps):
     return d_model ** -0.5 * min(step ** -0.5, step * warmup ** -1.5)
 
 
-def save_checkpoint(step, model, optimizer, scheduler, scaler, ckpt_dir):
+def save_checkpoint(step, model, optimizer, scheduler, scaler, ckpt_dir,
+                     best_val_loss=None, is_best=False):
     ckpt_dir = Path(ckpt_dir)
     state = {
-        "step":      step,
-        "model":     model.state_dict(),
-        "optimizer": optimizer.state_dict(),
-        "scheduler": scheduler.state_dict(),
-        "scaler":    scaler.state_dict(),
+        "step":          step,
+        "model":         model.state_dict(),
+        "optimizer":     optimizer.state_dict(),
+        "scheduler":     scheduler.state_dict(),
+        "scaler":        scaler.state_dict(),
+        "best_val_loss": best_val_loss,
     }
     ckpt_path = ckpt_dir / f"step_{step}.pt"
     torch.save(state, ckpt_path)
@@ -49,6 +51,14 @@ def save_checkpoint(step, model, optimizer, scheduler, scaler, ckpt_dir):
     tmp = ckpt_dir / "latest.pt.tmp"
     torch.save(state, tmp)
     tmp.replace(ckpt_dir / "latest.pt")
+
+    # best.pt tracks the lowest validation loss seen so far, independent of the
+    # step_*.pt pruning below — training loss can keep dropping from overfitting
+    # long after val loss bottoms out, so "most recent" != "best generalizing"
+    if is_best:
+        tmp_best = ckpt_dir / "best.pt.tmp"
+        torch.save(state, tmp_best)
+        tmp_best.replace(ckpt_dir / "best.pt")
 
     # prune old step_*.pt checkpoints — unbounded accumulation fills the disk
     # and corrupts the next torch.save mid-write (seen in practice on Vast.ai)
@@ -61,17 +71,30 @@ def save_checkpoint(step, model, optimizer, scheduler, scaler, ckpt_dir):
     for _, old_path in numbered[KEEP_LAST_N:]:
         old_path.unlink(missing_ok=True)
 
-    # optional off-machine backup: set HF_CKPT_REPO to push latest.pt to HuggingFace
-    # (needed on Kaggle/RunPod where the filesystem dies with the session)
+    # optional off-machine backup: set HF_CKPT_REPO to push latest.pt (and
+    # best.pt, when improved) to HuggingFace — needed on Kaggle/RunPod/Vast.ai
+    # where the filesystem dies with the session
     repo = os.environ.get("HF_CKPT_REPO")
     if repo:
         try:
             from huggingface_hub import HfApi
-            HfApi().upload_file(
+            api = HfApi()
+            api.upload_file(
                 path_or_fileobj=str(ckpt_dir / "latest.pt"),
                 path_in_repo="latest.pt",
                 repo_id=repo, repo_type="model",
             )
+            if is_best:
+                api.upload_file(
+                    path_or_fileobj=str(ckpt_dir / "best.pt"),
+                    path_in_repo="best.pt",
+                    repo_id=repo, repo_type="model",
+                )
+            # squash git history after every push — each overwrite of the same
+            # path otherwise keeps the old blob in history forever, silently
+            # burning through the account's private storage quota over
+            # hundreds of pushes until every future upload starts failing
+            api.super_squash_history(repo, repo_type="model")
         except Exception as e:
             print(f"\nHF checkpoint upload failed (continuing): {e}")
 
@@ -116,20 +139,30 @@ def train(resume_path=None):
     model.variance_adaptor.set_stats(**stats)
     print(f"Model parameters: {model.count_parameters():,}")
 
-    optimizer = torch.optim.Adam(model.parameters(), lr=1.0, betas=(0.9, 0.98), eps=1e-9)
+    optimizer = torch.optim.Adam(model.parameters(), lr=1.0, betas=(0.9, 0.98), eps=1e-9,
+                                  weight_decay=tcfg.weight_decay)
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, get_lr)
     scaler    = GradScaler("cuda", enabled=tcfg.fp16)
 
     start_step = 0
+    best_val_loss = float("inf")
     if resume_path:
         ckpt = torch.load(resume_path, map_location=device)
         model.load_state_dict(ckpt["model"])
         optimizer.load_state_dict(ckpt["optimizer"])
+        # override whatever weight_decay was saved in the old checkpoint —
+        # load_state_dict restores param_groups verbatim, so a config change
+        # (e.g. newly enabling weight decay) would otherwise be silently
+        # discarded on every resume
+        for group in optimizer.param_groups:
+            group["weight_decay"] = tcfg.weight_decay
         scheduler.load_state_dict(ckpt["scheduler"])
         if "scaler" in ckpt:
             scaler.load_state_dict(ckpt["scaler"])
+        if ckpt.get("best_val_loss") is not None:
+            best_val_loss = ckpt["best_val_loss"]
         start_step = ckpt["step"]
-        print(f"Resumed from step {start_step}")
+        print(f"Resumed from step {start_step} (best val loss so far: {best_val_loss:.4f})")
 
     running_loss = 0.0
     model.train()
@@ -137,6 +170,7 @@ def train(resume_path=None):
 
     pbar = tqdm(range(start_step, tcfg.max_steps), initial=start_step, total=tcfg.max_steps)
     for step in pbar:
+        is_best = False
 
         try:
             batch = next(train_iter)
@@ -220,14 +254,20 @@ def train(resume_path=None):
             val_mel_loss = sum(val_losses) / len(val_losses)
             print(f"\n[step {step+1}] val mel loss: {val_mel_loss:.4f}")
             writer.add_scalar("val/mel_loss", val_mel_loss, step + 1)
+            if val_mel_loss < best_val_loss:
+                best_val_loss = val_mel_loss
+                is_best = True
+                print(f"New best val loss: {best_val_loss:.4f}")
             model.train()
 
         if (step + 1) % SAVE_EVERY == 0:
             ckpt_path = save_checkpoint(
                 step + 1, model, optimizer, scheduler, scaler,
-                paths.fastspeech_ckpt_dir
+                paths.fastspeech_ckpt_dir,
+                best_val_loss=best_val_loss, is_best=is_best,
             )
-            print(f"\nSaved: {ckpt_path.name}  (latest.pt updated)")
+            suffix = "  (new best.pt saved)" if is_best else ""
+            print(f"\nSaved: {ckpt_path.name}  (latest.pt updated){suffix}")
 
     writer.close()
     print("FastSpeech2 training complete.")
