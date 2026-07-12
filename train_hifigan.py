@@ -25,6 +25,7 @@ already match the official layout exactly.
 """
 
 import os
+import re
 import argparse
 import torch
 import torch.nn.functional as F
@@ -41,6 +42,8 @@ from vocoder.generator import Generator, config_from_hcfg
 from vocoder.discriminator  import MPD, MSD
 from vocoder.losses         import (discriminator_loss, generator_adversarial_loss,
                                     feature_matching_loss, mel_reconstruction_loss)
+
+KEEP_LAST_N = 1  # g_step_*.pt/d_step_*.pt checkpoints to retain besides latest
 
 
 class WavMelDataset(Dataset):
@@ -277,6 +280,18 @@ def train(resume_g=None, resume_d=None, init_g=None, init_d=None):
                 tmp = paths.hifigan_ckpt_dir / f"{name}.tmp"
                 torch.save(state, tmp)
                 tmp.replace(paths.hifigan_ckpt_dir / name)
+
+            # prune old g_step_*.pt/d_step_*.pt — unbounded accumulation fills
+            # the disk and corrupts the next torch.save mid-write
+            for prefix in ("g_step_", "d_step_"):
+                numbered = []
+                for p in paths.hifigan_ckpt_dir.glob(f"{prefix}*.pt"):
+                    m = re.fullmatch(rf"{prefix}(\d+)\.pt", p.name)
+                    if m:
+                        numbered.append((int(m.group(1)), p))
+                numbered.sort(key=lambda t: t[0], reverse=True)
+                for _, old_path in numbered[KEEP_LAST_N:]:
+                    old_path.unlink(missing_ok=True)
             print(f"\nSaved: {g_path.name}, {d_path.name}  (g_latest/d_latest updated)")
 
             # optional off-machine backup — set HF_HIFIGAN_CKPT_REPO to push

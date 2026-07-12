@@ -13,6 +13,7 @@ Usage:
 import argparse
 import json
 import os
+import re
 import torch
 import torch.nn.functional as F
 from torch.amp import GradScaler, autocast
@@ -25,6 +26,7 @@ from data.dataset import get_loaders
 from model.fastspeech2 import FastSpeech2, masked_mse, duration_loss
 
 SAVE_EVERY = 1000   # save every 1000 steps
+KEEP_LAST_N = 1      # step_*.pt checkpoints to retain besides latest.pt (each ~500MB)
 
 
 def get_lr(step, d_model=mcfg.d_model, warmup=tcfg.warmup_steps):
@@ -47,6 +49,17 @@ def save_checkpoint(step, model, optimizer, scheduler, scaler, ckpt_dir):
     tmp = ckpt_dir / "latest.pt.tmp"
     torch.save(state, tmp)
     tmp.replace(ckpt_dir / "latest.pt")
+
+    # prune old step_*.pt checkpoints — unbounded accumulation fills the disk
+    # and corrupts the next torch.save mid-write (seen in practice on Vast.ai)
+    numbered = []
+    for p in ckpt_dir.glob("step_*.pt"):
+        m = re.fullmatch(r"step_(\d+)\.pt", p.name)
+        if m:
+            numbered.append((int(m.group(1)), p))
+    numbered.sort(key=lambda t: t[0], reverse=True)
+    for _, old_path in numbered[KEEP_LAST_N:]:
+        old_path.unlink(missing_ok=True)
 
     # optional off-machine backup: set HF_CKPT_REPO to push latest.pt to HuggingFace
     # (needed on Kaggle/RunPod where the filesystem dies with the session)
