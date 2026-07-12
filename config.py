@@ -56,9 +56,10 @@ class TrainFastSpeechConfig:
     max_steps: int = 300_000
     grad_clip: float = 0.5
     fp16: bool = True
-    # L2 regularisation — val loss was climbing while train loss kept falling
-    # past ~step 90k (overfitting), this default was 0 before
-    weight_decay: float = 1e-6
+    # L2 regularisation — val loss climbed steadily past ~step 90k while train
+    # loss kept falling (overfitting). 1e-6 proved negligible in practice —
+    # went straight to something that actually changes the update.
+    weight_decay: float = 1e-4
 
     # loss weights
     mel_loss_weight: float = 1.0
