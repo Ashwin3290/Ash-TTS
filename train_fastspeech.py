@@ -94,11 +94,12 @@ def save_checkpoint(step, model, optimizer, scheduler, scaler, ckpt_dir,
     for _, old_path in numbered[KEEP_LAST_N:]:
         old_path.unlink(missing_ok=True)
 
-    # optional off-machine backup: set HF_CKPT_REPO to push latest.pt (and
-    # best.pt, when improved) to HuggingFace — needed on Kaggle/RunPod/Vast.ai
-    # where the filesystem dies with the session
+    # optional off-machine backup: set HF_CKPT_REPO to push best.pt to
+    # HuggingFace whenever it improves. latest.pt stays local-only — it's
+    # only needed to resume the current session, and best.pt is the one
+    # actually worth keeping off-machine.
     repo = os.environ.get("HF_CKPT_REPO")
-    if repo:
+    if repo and is_best:
         try:
             from huggingface_hub import HfApi
             api = HfApi()
@@ -108,24 +109,14 @@ def save_checkpoint(step, model, optimizer, scheduler, scaler, ckpt_dir,
             # release it (squash_history() alone was seen to leave ~7GB behind
             # despite only ~1GB of files being visible)
             try:
-                api.delete_file("latest.pt", repo_id=repo, repo_type="model")
+                api.delete_file("best.pt", repo_id=repo, repo_type="model")
             except Exception:
                 pass  # first push ever — nothing to delete yet
             api.upload_file(
-                path_or_fileobj=str(ckpt_dir / "latest.pt"),
-                path_in_repo="latest.pt",
+                path_or_fileobj=str(ckpt_dir / "best.pt"),
+                path_in_repo="best.pt",
                 repo_id=repo, repo_type="model",
             )
-            if is_best:
-                try:
-                    api.delete_file("best.pt", repo_id=repo, repo_type="model")
-                except Exception:
-                    pass
-                api.upload_file(
-                    path_or_fileobj=str(ckpt_dir / "best.pt"),
-                    path_in_repo="best.pt",
-                    repo_id=repo, repo_type="model",
-                )
             api.super_squash_history(repo, repo_type="model")
         except Exception as e:
             print(f"\nHF checkpoint upload failed (continuing): {e}")

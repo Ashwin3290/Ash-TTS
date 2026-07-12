@@ -44,12 +44,15 @@ HF_CKPT_REPO = "Ashwin-C9/tts-fastspeech2-ckpt"
 HIFIGAN_DIR = Path("GAN model")  # generator_v1 + config.json, already local
 
 
-def pull_latest_checkpoint():
+def pull_best_checkpoint():
+    # only best.pt is published to HF now — latest.pt stays local-only on
+    # whatever instance is training, since it's just a same-session resume
+    # point and best.pt is the one actually worth pulling down to test
     ckpt_dir = paths.fastspeech_ckpt_dir
     ckpt_dir.mkdir(parents=True, exist_ok=True)
-    print(f"Pulling latest.pt from {HF_CKPT_REPO}...")
-    downloaded = hf_hub_download(HF_CKPT_REPO, "latest.pt", repo_type="model")
-    dest = ckpt_dir / "latest.pt"
+    print(f"Pulling best.pt from {HF_CKPT_REPO}...")
+    downloaded = hf_hub_download(HF_CKPT_REPO, "best.pt", repo_type="model")
+    dest = ckpt_dir / "best.pt"
     dest.write_bytes(Path(downloaded).read_bytes())
     print(f"Saved to {dest}")
     return dest
@@ -79,7 +82,7 @@ def main(utt_id, text, output_dir):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
 
-    ckpt_path = pull_latest_checkpoint()
+    ckpt_path = pull_best_checkpoint()
     ckpt = torch.load(ckpt_path, map_location=device)
     print(f"Checkpoint step: {ckpt['step']}")
 
