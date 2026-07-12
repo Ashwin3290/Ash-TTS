@@ -53,7 +53,12 @@ class TrainFastSpeechConfig:
     batch_size: int = 16
     learning_rate: float = 1e-3
     warmup_steps: int = 1000
-    max_steps: int = 300_000
+    # the previous run first started overfitting ~step 90k (before weight
+    # decay existed); this restart has proper decoupled AdamW + bias/norm
+    # exclusion active from step 0, so this ceiling gives real headroom past
+    # that point without blindly repeating the full 300k budget that wasted
+    # its back half on a model that was already overfitting
+    max_steps: int = 150_000
     grad_clip: float = 0.5
     fp16: bool = True
     # decoupled weight decay (AdamW) — val loss climbed steadily past ~step 90k
