@@ -237,3 +237,5 @@ do_v1
 do_universal
 /logs
 /test_output
+/test_output_*
+/.overnight
