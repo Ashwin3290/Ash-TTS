@@ -1,176 +1,143 @@
 """
-CTC Forced Aligner using torchaudio MMS_FA.
+Phone-level CTC forced aligner using facebook/wav2vec2-lv-60-espeak-cv-ft.
 
-MMS_FA is a character-level model — it aligns raw text characters (a, b, c...)
-against audio, NOT IPA phonemes. The strategy here is:
+The previous version of this file aligned WORDS (via character-level MMS_FA)
+and split each word's frames uniformly across its phonemes. That destroyed
+real duration structure: 75% of all phoneme durations landed in a 7-10 frame
+band (true speech has stops at ~3-5 frames and stressed vowels at 10-25),
+so the duration predictor collapsed to a near-constant ~8.8 frames and
+synthesis came out with a halting, evenly-paced, robotic rhythm.
 
-  1. Align words to audio using MMS_FA character alignment
-  2. Phonemize each word separately to get its phoneme sequence
-  3. Distribute the word's frames across its phonemes proportionally
+This version force-aligns our exact espeak phoneme sequences directly
+against a CTC model that emits espeak IPA phones — same inventory, verified
+1:1 coverage after stripping stress marks. Durations come from real acoustic
+evidence per phoneme, not uniform splitting.
 
-This gives us per-phoneme durations without needing MFA or Kaldi.
+Reads phoneme ids straight from data/processed/phoneme/*.npy (no
+phonemizer/espeak needed at alignment time).
 
 Usage:
     python align.py
     python align.py --overwrite
 """
 
-import os
-import sys
 import json
 import argparse
 import numpy as np
 from pathlib import Path
 from tqdm import tqdm
 
-if sys.platform == "win32":
-    os.environ.setdefault(
-        "PHONEMIZER_ESPEAK_LIBRARY",
-        r"C:\Program Files\eSpeak NG\libespeak-ng.dll"
-    )
-
 import torch
 import torchaudio
-from torchaudio.pipelines import MMS_FA as BUNDLE
-from phonemizer.backend import EspeakBackend
-from phonemizer.separator import Separator
+from huggingface_hub import hf_hub_download
 
 from config import audio as acfg, paths
 
-ALIGN_SR      = BUNDLE.sample_rate  # 16000
-LABELS        = BUNDLE.get_labels()
-LABEL2IDX     = {l: i for i, l in enumerate(LABELS)}
-BLANK_IDX     = LABEL2IDX.get('|', 0)
-W2V_HOP       = 320
+ALIGNER_MODEL = "facebook/wav2vec2-lv-60-espeak-cv-ft"
+ALIGN_SR      = 16000
+W2V_HOP       = 320                      # wav2vec2 conv stack: 20ms per emission frame
 W2V_FRAME_SEC = W2V_HOP / ALIGN_SR
 MEL_FRAME_SEC = acfg.hop_length / acfg.sample_rate
 
-
-def get_phonemizer():
-    return EspeakBackend("en-us", preserve_punctuation=False, with_stress=True)
+STRESS_MARKS = ("ˈ", "ˌ")      # ˈ primary, ˌ secondary
 
 
-def phonemize_words(words, backend):
+def strip_stress(phone):
+    for m in STRESS_MARKS:
+        phone = phone.replace(m, "")
+    return phone
+
+
+def load_aligner(device):
+    """CTC model + its phone vocab.
+
+    Avoids the HF tokenizer class (it insists on initialising a phonemizer
+    backend, which needs espeak, just to hold a vocab dict we can read from
+    vocab.json directly) and avoids from_pretrained for the weights (the
+    repo only ships pytorch_model.bin, which newer transformers refuses to
+    torch.load on torch<2.6 — loading with weights_only=True ourselves is
+    safe and version-agnostic)."""
+    from transformers import Wav2Vec2ForCTC, Wav2Vec2Config
+    config = Wav2Vec2Config.from_pretrained(ALIGNER_MODEL)
+    model = Wav2Vec2ForCTC(config)
+    bin_path = hf_hub_download(ALIGNER_MODEL, "pytorch_model.bin")
+    state = torch.load(bin_path, map_location="cpu", weights_only=True)
+    missing, unexpected = model.load_state_dict(state, strict=False)
+    # tolerate only cosmetic mismatches (e.g. masked_spec_embed buffers)
+    real_missing = [k for k in missing if not k.endswith("masked_spec_embed")]
+    if real_missing or unexpected:
+        raise RuntimeError(f"aligner weight mismatch: missing={real_missing} "
+                           f"unexpected={unexpected}")
+    model = model.to(device)
+    model.eval()
+    vocab_path = hf_hub_download(ALIGNER_MODEL, "vocab.json")
+    with open(vocab_path, encoding="utf-8") as f:
+        aligner_vocab = json.load(f)
+    blank_id = aligner_vocab["<pad>"]
+    return model, aligner_vocab, blank_id
+
+
+def distribute_to_frames(boundaries_sec, n_frames):
     """
-    Phonemize all words at once using word boundary separator.
-    This matches what preprocess.py does, avoiding coarticulation mismatches.
+    Convert per-phoneme boundary times (seconds, len n_phones+1, last entry
+    is total audio duration) into integer mel-frame durations that sum to
+    exactly n_frames, each at least 1.
     """
-    sep = Separator(phone=' ', word='| ', syllable='')
-    full_text = ' '.join(words)
-    ph_str = backend.phonemize([full_text], separator=sep)[0]
-    # split on word boundary marker
-    word_segments = ph_str.split('|')
-    results = []
-    for seg in word_segments:
-        phones = [p for p in seg.split() if p.strip()]
-        results.append(phones if phones else ['_'])
-    # pad or trim to match word count
-    while len(results) < len(words):
-        results.append(['_'])
-    return results[:len(words)]
+    n_phones = len(boundaries_sec) - 1
+    total_sec = boundaries_sec[-1]
+    if total_sec <= 0:
+        return None
+    # scale boundaries onto [0, n_frames] then round — cumulative rounding
+    # guarantees the sum is exact, unlike rounding each span independently
+    bounds = np.round(np.array(boundaries_sec) / total_sec * n_frames).astype(np.int64)
+    bounds[0], bounds[-1] = 0, n_frames
+    durations = np.diff(bounds)
+    # enforce min 1 frame per phoneme, stealing from the largest spans
+    for i in np.where(durations < 1)[0]:
+        need = 1 - durations[i]
+        donor = int(np.argmax(durations))
+        if durations[donor] - need < 1:
+            return None  # utterance shorter than its phoneme count — hopeless
+        durations[donor] -= need
+        durations[i] += need
+    return durations.tolist()
 
 
-def text_to_char_tokens(text):
-    words = text.lower().split()
-    token_ids     = []
-    word_of_token = []
-    valid_words   = []
-
-    for w_idx, word in enumerate(words):
-        # strip punctuation for alignment, keep only alpha chars in MMS vocab
-        # critically exclude index 0 (blank token '-') from tokens
-        chars = [c for c in word if c in LABEL2IDX and LABEL2IDX[c] != BLANK_IDX]
-        if not chars:
-            continue
-        valid_words.append(word)
-        for c in chars:
-            token_ids.append(LABEL2IDX[c])
-            word_of_token.append(len(valid_words) - 1)
-
-    return token_ids, word_of_token, valid_words
-
-
-def align_utterance(wav_path, text, n_phones, model, device, backend):
+def align_utterance(wav_path, aligner_ids, n_mel_frames, model, device, blank_id):
     waveform, sr = torchaudio.load(str(wav_path))
     if sr != ALIGN_SR:
         waveform = torchaudio.functional.resample(waveform, sr, ALIGN_SR)
-    waveform = waveform.mean(dim=0, keepdim=True).to(device)
+    waveform = waveform.mean(dim=0, keepdim=True)
+    # lv60 models are trained on zero-mean/unit-variance input
+    waveform = (waveform - waveform.mean()) / (waveform.std() + 1e-7)
+    waveform = waveform.to(device)
 
     with torch.inference_mode():
-        emissions, _ = model(waveform)
-    emissions = torch.log_softmax(emissions, dim=-1)
+        emissions = model(waveform).logits
+    emissions = torch.log_softmax(emissions.float(), dim=-1)
 
-    token_ids, word_of_token, words = text_to_char_tokens(text)
-    if not token_ids:
-        return None
-
+    tokens = torch.tensor(aligner_ids, dtype=torch.long, device=device).unsqueeze(0)
     try:
-        token_ids_t = torch.tensor(token_ids, dtype=torch.long, device=device)
-        aligned_tokens, scores = torchaudio.functional.forced_align(
-            emissions, token_ids_t.unsqueeze(0), blank=BLANK_IDX
+        aligned, scores = torchaudio.functional.forced_align(
+            emissions, tokens, blank=blank_id
         )
-        spans = torchaudio.functional.merge_tokens(aligned_tokens[0], scores[0])
+        spans = torchaudio.functional.merge_tokens(aligned[0], scores[0])
     except Exception:
         return None
 
-    if not spans:
+    if len(spans) != len(aligner_ids):
         return None
 
-    # spans[i].token is the label ID, not the position in token_ids list
-    # we need to map each span back to its position sequentially
-    # since forced_align is monotonic, span i corresponds to token_ids[i]
-    n_words    = len(words)
-    word_start = [None] * n_words
-    word_end   = [None] * n_words
+    # boundary between phones i-1 and i = start of span i; inter-phone gaps
+    # (CTC blanks) therefore attach to the preceding phone. Head silence goes
+    # to the first phone, tail silence to the last.
+    n_emission = emissions.size(1)
+    boundaries_sec = [0.0]
+    for span in spans[1:]:
+        boundaries_sec.append(span.start * W2V_FRAME_SEC)
+    boundaries_sec.append(n_emission * W2V_FRAME_SEC)
 
-    for span_idx, span in enumerate(spans):
-        if span_idx >= len(word_of_token):
-            continue
-        w_idx = word_of_token[span_idx]
-        if word_start[w_idx] is None:
-            word_start[w_idx] = span.start
-        word_end[w_idx] = span.end
-
-    # fill missing word spans from neighbours
-    for i in range(n_words):
-        if word_start[i] is None:
-            prev_end = word_end[i-1] if i > 0 and word_end[i-1] is not None else 0
-            word_start[i] = prev_end
-            word_end[i]   = prev_end + 1
-
-    # bridge inter-word gaps and head/tail silence: MMS-FA spans are tight
-    # around speech, so pauses (~30% of frames on LJSpeech) would otherwise be
-    # assigned to no phoneme and the duration/mel timelines drift apart
-    word_start[0] = 0
-    for i in range(n_words - 1):
-        word_end[i] = word_start[i + 1]
-    word_end[-1] = emissions.size(1)
-
-    # phonemize each word to get phone count per word
-    word_phones = phonemize_words(words, backend)
-
-    # distribute word frames across phonemes
-    durations = []
-    for w_idx, w_phones in enumerate(word_phones):
-        start_sec   = word_start[w_idx] * W2V_FRAME_SEC
-        end_sec     = word_end[w_idx]   * W2V_FRAME_SEC
-        word_frames = max(len(w_phones), round((end_sec - start_sec) / MEL_FRAME_SEC))
-        n_ph = len(w_phones)
-        base = word_frames // n_ph
-        rem  = word_frames % n_ph
-        for j in range(n_ph):
-            durations.append(base + (1 if j < rem else 0))
-
-    # match length to n_phones
-    if len(durations) != n_phones:
-        if not durations:
-            return None
-        total = sum(durations)
-        base  = total // n_phones
-        rem   = total % n_phones
-        durations = [base + (1 if i < rem else 0) for i in range(n_phones)]
-
-    return durations
+    return distribute_to_frames(boundaries_sec, n_mel_frames)
 
 
 def run_alignment(data_root, processed_dir, overwrite=False, device=None):
@@ -189,6 +156,10 @@ def run_alignment(data_root, processed_dir, overwrite=False, device=None):
     if not ph_dir.exists():
         raise RuntimeError("Run preprocess.py first — phoneme files not found.")
 
+    with open(processed_dir / "phoneme_vocab.json", encoding="utf-8") as f:
+        vocab = json.load(f)
+    inv_vocab = {v: k for k, v in vocab.items()}
+
     utt_ids = [f.stem for f in ph_dir.glob("*.npy")]
     print(f"Found {len(utt_ids)} preprocessed utterances")
 
@@ -200,53 +171,53 @@ def run_alignment(data_root, processed_dir, overwrite=False, device=None):
         print("All utterances already aligned.")
         return
 
-    metadata_path = data_root / "metadata.csv"
-    text_map = {}
-    for line in open(metadata_path, encoding="utf-8"):
-        parts = line.strip().split("|")
-        if len(parts) >= 3:
-            text_map[parts[0]] = parts[2]
-
-    print("Loading MMS_FA model...")
-    model = BUNDLE.get_model().to(device)
-    model.eval()
+    print(f"Loading {ALIGNER_MODEL}...")
+    model, aligner_vocab, blank_id = load_aligner(device)
     print("Model loaded.")
 
-    backend  = get_phonemizer()
+    # our phoneme id -> aligner token id (stress marks stripped; coverage of
+    # the full vocab was verified 1:1 before this aligner was adopted)
+    def to_aligner_ids(ph_ids):
+        out = []
+        for pid in ph_ids:
+            phone = strip_stress(inv_vocab.get(int(pid), ""))
+            aid = aligner_vocab.get(phone)
+            if aid is None:
+                return None
+            out.append(aid)
+        return out
+
     success  = 0
     fallback = 0
     failed   = 0
 
     for utt_id in tqdm(utt_ids, desc="aligning"):
         wav_path = wav_dir / f"{utt_id}.wav"
-        if not wav_path.exists():
-            failed += 1
-            continue
-
-        text = text_map.get(utt_id, "")
-        if not text:
+        mel_path = mel_dir / f"{utt_id}.npy"
+        if not wav_path.exists() or not mel_path.exists():
             failed += 1
             continue
 
         ph_ids   = np.load(ph_dir / f"{utt_id}.npy")
-        n_phones = len(ph_ids)
+        n_frames = np.load(mel_path, mmap_mode="r").shape[0]
 
-        try:
-            durations = align_utterance(wav_path, text, n_phones, model, device, backend)
-        except Exception:
-            durations = None
+        durations = None
+        aligner_ids = to_aligner_ids(ph_ids)
+        if aligner_ids is not None:
+            try:
+                durations = align_utterance(
+                    wav_path, aligner_ids, n_frames, model, device, blank_id)
+            except Exception:
+                durations = None
 
         if durations is None:
-            mel_path = mel_dir / f"{utt_id}.npy"
-            if mel_path.exists():
-                n_frames = np.load(mel_path).shape[0]
-                base = n_frames // n_phones
-                rem  = n_frames % n_phones
-                durations = [base + (1 if i < rem else 0) for i in range(n_phones)]
-                fallback += 1
-            else:
-                failed += 1
-                continue
+            # uniform fallback — keeps the pipeline unblocked for the rare
+            # utterance the CTC path can't handle
+            n_ph = len(ph_ids)
+            base = n_frames // n_ph
+            rem  = n_frames % n_ph
+            durations = [base + (1 if i < rem else 0) for i in range(n_ph)]
+            fallback += 1
 
         np.save(dur_dir / f"{utt_id}.npy", np.array(durations, dtype=np.int32))
         success += 1
