@@ -101,7 +101,9 @@ class HiFiGANConfig:
     adam_b1: float = 0.8
     adam_b2: float = 0.99
     lr_decay: float = 0.999
-    max_steps: int = 500_000
+    # 500k was sized for training the vocoder from scratch — fine-tuning from
+    # the pretrained official generator_v1 needs far fewer steps to adapt
+    max_steps: int = 100_000
     fp16: bool = True
 
     # audio segment for training — HiFi-GAN trains on fixed-length chunks, not full utterances
