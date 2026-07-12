@@ -70,7 +70,14 @@ class WavMelDataset(Dataset):
         if sr != acfg.sample_rate:
             wav = librosa.resample(wav, orig_sr=sr, target_sr=acfg.sample_rate)
 
-        mel = np.load(self.mel_dir / f"{utt_id}.npy")  # (T, 80)
+        mel = np.load(self.mel_dir / f"{utt_id}.npy")  # (T, 80), normalised [-1,1]
+        # denormalise to the raw natural-log mel scale (~[-11.5, 2]) that both
+        # the pretrained official generator and our own get_mel_fn() operate
+        # in — feeding the [-1,1] preprocessing scale straight to a generator
+        # whose conv_pre weights expect natural-log-scale input produces
+        # garbage (this was the root cause of an unintelligible/noise-like
+        # fine-tuned generator; see mel_min/mel_max in config.py)
+        mel = (mel + 1) / 2 * (acfg.mel_max - acfg.mel_min) + acfg.mel_min
 
         # random crop, snapped to mel frame boundaries — picking an arbitrary
         # sample offset and flooring it shifts the waveform up to hop_length-1
