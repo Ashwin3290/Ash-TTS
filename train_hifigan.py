@@ -51,12 +51,12 @@ class WavMelDataset(Dataset):
     Loads raw wavs + ground truth mels for HiFi-GAN training.
     HiFi-GAN trains on random fixed-length chunks, not full utterances.
     """
-    def __init__(self, manifest_path, data_root, processed_dir):
+    def __init__(self, manifest_path, data_root, processed_dir, mel_subdir="mel"):
         import json
         with open(manifest_path) as f:
             self.manifest = json.load(f)
         self.wav_dir = Path(data_root) / "wavs"
-        self.mel_dir = Path(processed_dir) / "mel"
+        self.mel_dir = Path(processed_dir) / mel_subdir
         self.segment = hcfg.segment_length
 
     def __len__(self):
@@ -72,21 +72,26 @@ class WavMelDataset(Dataset):
 
         mel = np.load(self.mel_dir / f"{utt_id}.npy")  # (T, 80)
 
-        # random crop to segment_length samples
-        if len(wav) >= self.segment:
-            start = np.random.randint(0, len(wav) - self.segment)
+        # random crop, snapped to mel frame boundaries — picking an arbitrary
+        # sample offset and flooring it shifts the waveform up to hop_length-1
+        # samples (~12ms) against its conditioning mel on every clip.
+        # usable_frames also trims mel/wav to their common length, since
+        # predicted mels (mel_pred) can differ from the audio by a few frames.
+        mel_frames = self.segment // acfg.hop_length
+        usable_frames = min(len(mel), len(wav) // acfg.hop_length)
+        if usable_frames > mel_frames:
+            mel_start = np.random.randint(0, usable_frames - mel_frames)
+            start = mel_start * acfg.hop_length
             wav = wav[start:start + self.segment]
-            # align mel: start frame = start_sample // hop_length
-            mel_start = start // acfg.hop_length
-            mel_frames = self.segment // acfg.hop_length
             mel = mel[mel_start:mel_start + mel_frames]
         else:
-            # pad short clips
-            wav = np.pad(wav, (0, self.segment - len(wav)))
-            mel_frames = self.segment // acfg.hop_length
+            wav = wav[:mel_frames * acfg.hop_length]
             mel = mel[:mel_frames]
-            if len(mel) < mel_frames:
-                mel = np.pad(mel, ((0, mel_frames - len(mel)), (0, 0)))
+        # pad short clips
+        if len(wav) < self.segment:
+            wav = np.pad(wav, (0, self.segment - len(wav)))
+        if len(mel) < mel_frames:
+            mel = np.pad(mel, ((0, mel_frames - len(mel)), (0, 0)))
 
         return {
             "wav": torch.from_numpy(wav).unsqueeze(0),   # (1, segment)
@@ -108,13 +113,17 @@ def get_mel_fn(device):
     ).to(device)
 
     def mel_fn(wav):
-        mel = mel_transform(wav)
-        return torch.log(mel.clamp(min=1e-5))
+        # always fp32: under fp16 autocast the power spectrogram overflows
+        # (values exceed fp16 max) -> inf -> NaN mel loss -> GradScaler
+        # silently skips every generator update while d_loss stays finite
+        with torch.autocast("cuda", enabled=False):
+            mel = mel_transform(wav.float())
+            return torch.log(mel.clamp(min=1e-5))
 
     return mel_fn
 
 
-def train(resume_g=None, resume_d=None, init_g=None, init_d=None):
+def train(resume_g=None, resume_d=None, init_g=None, init_d=None, mel_subdir="mel"):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
 
@@ -124,7 +133,9 @@ def train(resume_g=None, resume_d=None, init_g=None, init_d=None):
     train_ds = WavMelDataset(
         paths.processed_dir / "train_manifest.json",
         paths.data_root, paths.processed_dir,
+        mel_subdir=mel_subdir,
     )
+    print(f"Conditioning mels: data/processed/{mel_subdir}")
     num_workers = 0 if os.name == "nt" else 4
     train_loader = DataLoader(
         train_ds,
@@ -336,6 +347,10 @@ if __name__ == "__main__":
     parser.add_argument("--init-d", default=None,
                         help="Path to official pretrained discriminator checkpoint "
                              "(e.g. do_v1) to fine-tune from")
+    parser.add_argument("--mel-dir", default="mel",
+                        help="Subdir of data/processed with conditioning mels — "
+                             "use 'mel_pred' (from generate_mels.py) to fine-tune "
+                             "on FastSpeech2's predicted mels")
     args = parser.parse_args()
 
     if args.resume == "auto" and not (args.resume_g or args.resume_d):
@@ -351,4 +366,4 @@ if __name__ == "__main__":
             print("No g_latest.pt found, starting fresh.")
 
     train(resume_g=args.resume_g, resume_d=args.resume_d,
-          init_g=args.init_g, init_d=args.init_d)
+          init_g=args.init_g, init_d=args.init_d, mel_subdir=args.mel_dir)

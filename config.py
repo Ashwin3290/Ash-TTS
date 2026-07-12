@@ -101,9 +101,9 @@ class HiFiGANConfig:
     adam_b1: float = 0.8
     adam_b2: float = 0.99
     lr_decay: float = 0.999
-    # capped to finish in ~1hr at the observed ~4 it/s on this instance —
-    # fine-tuning from the pretrained generator_v1, not training from scratch
-    max_steps: int = 14_000
+    # budget for the predicted-mel fine-tune pass (~1.7h at the observed
+    # ~4 it/s) — fine-tuning from already-adapted weights, not from scratch
+    max_steps: int = 25_000
     fp16: bool = True
 
     # audio segment for training — HiFi-GAN trains on fixed-length chunks, not full utterances

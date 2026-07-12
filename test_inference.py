@@ -51,7 +51,10 @@ def pull_best_checkpoint():
     ckpt_dir = paths.fastspeech_ckpt_dir
     ckpt_dir.mkdir(parents=True, exist_ok=True)
     print(f"Pulling best.pt from {HF_CKPT_REPO}...")
-    downloaded = hf_hub_download(HF_CKPT_REPO, "best.pt", repo_type="model")
+    # force_download: never trust the local HF cache here — a stale cached
+    # best.pt once made a barely-trained model look like a broken one
+    downloaded = hf_hub_download(HF_CKPT_REPO, "best.pt", repo_type="model",
+                                 force_download=True)
     dest = ckpt_dir / "best.pt"
     dest.write_bytes(Path(downloaded).read_bytes())
     print(f"Saved to {dest}")
@@ -75,7 +78,7 @@ def denorm_mel(mel):
     return (mel + 1) / 2 * (acfg.mel_max - acfg.mel_min) + acfg.mel_min
 
 
-def main(utt_id, text, output_dir):
+def main(utt_id, text, output_dir, hifi_ckpt=None):
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -140,11 +143,25 @@ def main(utt_id, text, output_dir):
     fig.savefig(plot_path, dpi=120)
     print(f"Saved plot: {plot_path}")
 
-    # --- vocode predicted mel with the raw pretrained HiFi-GAN ---
-    hifi = load_pretrained_generator(
-        str(HIFIGAN_DIR / "generator_v1"), str(HIFIGAN_DIR / "config.json"), device
-    )
-    mel_for_vocoder = denorm_mel(pred_mel)  # official generator expects natural-log scale
+    # --- vocode the predicted mel ---
+    if hifi_ckpt:
+        # our own fine-tuned vocoder (train_hifigan.py checkpoint) — trained on
+        # the normalised [-1,1] mels FastSpeech2 predicts, so no denorm
+        from vocoder.generator import Generator, config_from_hcfg
+        hifi = Generator(config_from_hcfg(hcfg)).to(device)
+        hifi_state = torch.load(hifi_ckpt, map_location=device)
+        hifi.load_state_dict(hifi_state["generator"])
+        hifi.eval()
+        hifi.remove_weight_norm()
+        print(f"Vocoder: fine-tuned checkpoint {hifi_ckpt} (step {hifi_state.get('step', '?')})")
+        mel_for_vocoder = pred_mel
+    else:
+        # raw official pretrained HiFi-GAN — expects natural-log mel scale
+        hifi = load_pretrained_generator(
+            str(HIFIGAN_DIR / "generator_v1"), str(HIFIGAN_DIR / "config.json"), device
+        )
+        print("Vocoder: raw official generator_v1 (denormalising mel)")
+        mel_for_vocoder = denorm_mel(pred_mel)
     mel_t = torch.from_numpy(mel_for_vocoder.T).float().unsqueeze(0).to(device)
     with torch.no_grad():
         wav = hifi(mel_t).squeeze().cpu().numpy()
@@ -170,5 +187,10 @@ if __name__ == "__main__":
     parser.add_argument("--utt-id", default=None, help="Specific val_manifest utterance id")
     parser.add_argument("--text", default=None, help="Custom text instead of a val utterance")
     parser.add_argument("--output-dir", default="test_output")
+    parser.add_argument("--hifi-ckpt", default=None,
+                        help="Path to a fine-tuned train_hifigan.py checkpoint "
+                             "(e.g. checkpoints/hifigan/g_latest.pt). Default: "
+                             "raw official pretrained generator_v1.")
     args = parser.parse_args()
-    main(utt_id=args.utt_id, text=args.text, output_dir=args.output_dir)
+    main(utt_id=args.utt_id, text=args.text, output_dir=args.output_dir,
+         hifi_ckpt=args.hifi_ckpt)
