@@ -111,6 +111,7 @@ class HiFiGANConfig:
 
     log_every: int = 100
     save_every: int = 5000
+    val_every: int = 1000   # validation mel-L1 pass; drives g_best/d_best tracking
 
 
 @dataclass

@@ -147,6 +147,20 @@ def train(resume_g=None, resume_d=None, init_g=None, init_d=None, mel_subdir="me
     )
     print(f"Train batches: {len(train_loader)}")
 
+    val_ds = WavMelDataset(
+        paths.processed_dir / "val_manifest.json",
+        paths.data_root, paths.processed_dir,
+        mel_subdir=mel_subdir,
+    )
+    val_loader = DataLoader(
+        val_ds,
+        batch_size=hcfg.batch_size,
+        shuffle=False,
+        num_workers=0,   # in-process so the seeded np.random crop is deterministic
+        pin_memory=True,
+    )
+    print(f"Val batches: {len(val_loader)}")
+
     generator = Generator(config_from_hcfg(hcfg)).to(device)
     mpd = MPD().to(device)
     msd = MSD().to(device)
@@ -167,6 +181,7 @@ def train(resume_g=None, resume_d=None, init_g=None, init_d=None, mel_subdir="me
     scaler_d = GradScaler(enabled=hcfg.fp16)
 
     start_step = 0
+    best_val_mel = float("inf")
     if resume_g:
         # resuming our own training run — restore optimiser/scheduler/step too
         ckpt = torch.load(resume_g, map_location=device)
@@ -175,8 +190,11 @@ def train(resume_g=None, resume_d=None, init_g=None, init_d=None, mel_subdir="me
         sched_g.load_state_dict(ckpt["sched_g"])
         if "scaler_g" in ckpt:
             scaler_g.load_state_dict(ckpt["scaler_g"])
+        if ckpt.get("best_val_mel") is not None:
+            best_val_mel = ckpt["best_val_mel"]
         start_step = ckpt.get("step", 0)
-        print(f"Resumed generator from step {start_step}")
+        print(f"Resumed generator from step {start_step} "
+              f"(best val mel L1 so far: {best_val_mel:.4f})")
     elif init_g:
         # fine-tuning from an external pretrained checkpoint — weights only,
         # optimiser/scheduler/step start fresh since this is new training, not
@@ -202,6 +220,33 @@ def train(resume_g=None, resume_d=None, init_g=None, init_d=None, mel_subdir="me
     mel_fn = get_mel_fn(device)
     step = start_step
     train_iter = iter(train_loader)
+
+    def make_states(step):
+        g_state = {
+            "step": step,
+            "generator": generator.state_dict(),
+            "opt_g": opt_g.state_dict(),
+            "sched_g": sched_g.state_dict(),
+            "scaler_g": scaler_g.state_dict(),
+            "best_val_mel": best_val_mel,
+        }
+        d_state = {
+            "step": step,
+            "mpd": mpd.state_dict(),
+            "msd": msd.state_dict(),
+            "opt_d": opt_d.state_dict(),
+            "sched_d": sched_d.state_dict(),
+            "scaler_d": scaler_d.state_dict(),
+            "best_val_mel": best_val_mel,
+        }
+        return g_state, d_state
+
+    def save_atomic(state, name):
+        tmp = paths.hifigan_ckpt_dir / f"{name}.tmp"
+        torch.save(state, tmp)
+        tmp.replace(paths.hifigan_ckpt_dir / name)
+
+    new_best_since_save = False
 
     pbar = tqdm(range(start_step, hcfg.max_steps), initial=start_step, total=hcfg.max_steps)
     for step in pbar:
@@ -266,31 +311,42 @@ def train(resume_g=None, resume_d=None, init_g=None, init_d=None, mel_subdir="me
             writer.add_scalar("train/adv_loss", loss_adv.item(), step + 1)
             writer.add_scalar("train/lr_g", opt_g.param_groups[0]["lr"], step + 1)
 
+        if (step + 1) % hcfg.val_every == 0:
+            # validation mel-L1: the adversarial losses oscillate by design,
+            # so this is the metric that defines "best" for g_best/d_best
+            generator.eval()
+            rng_state = np.random.get_state()
+            np.random.seed(1234)  # deterministic val crops across passes
+            val_losses = []
+            with torch.no_grad():
+                for vbatch in val_loader:
+                    vwav = vbatch["wav"].to(device)
+                    vmel = vbatch["mel"].to(device)
+                    vfake = generator(vmel)
+                    vloss = F.l1_loss(mel_fn(vfake.squeeze(1)), mel_fn(vwav.squeeze(1)))
+                    val_losses.append(vloss.item())
+            np.random.set_state(rng_state)
+            generator.train()
+            val_mel = sum(val_losses) / len(val_losses)
+            print(f"\n[step {step+1}] val mel L1: {val_mel:.4f}")
+            writer.add_scalar("val/mel_l1", val_mel, step + 1)
+            if val_mel < best_val_mel:
+                best_val_mel = val_mel
+                new_best_since_save = True
+                g_state, d_state = make_states(step + 1)
+                save_atomic(g_state, "g_best.pt")
+                save_atomic(d_state, "d_best.pt")
+                print(f"New best val mel L1: {best_val_mel:.4f}  (g_best/d_best saved)")
+
         if (step + 1) % hcfg.save_every == 0:
             g_path = paths.hifigan_ckpt_dir / f"g_step_{step+1}.pt"
             d_path = paths.hifigan_ckpt_dir / f"d_step_{step+1}.pt"
-            g_state = {
-                "step": step + 1,
-                "generator": generator.state_dict(),
-                "opt_g": opt_g.state_dict(),
-                "sched_g": sched_g.state_dict(),
-                "scaler_g": scaler_g.state_dict(),
-            }
-            d_state = {
-                "step": step + 1,
-                "mpd": mpd.state_dict(),
-                "msd": msd.state_dict(),
-                "opt_d": opt_d.state_dict(),
-                "sched_d": sched_d.state_dict(),
-                "scaler_d": scaler_d.state_dict(),
-            }
+            g_state, d_state = make_states(step + 1)
             torch.save(g_state, g_path)
             torch.save(d_state, d_path)
             # atomic latest checkpoints for --resume auto
-            for state, name in ((g_state, "g_latest.pt"), (d_state, "d_latest.pt")):
-                tmp = paths.hifigan_ckpt_dir / f"{name}.tmp"
-                torch.save(state, tmp)
-                tmp.replace(paths.hifigan_ckpt_dir / name)
+            save_atomic(g_state, "g_latest.pt")
+            save_atomic(d_state, "d_latest.pt")
 
             # prune old g_step_*.pt/d_step_*.pt — unbounded accumulation fills
             # the disk and corrupts the next torch.save mid-write
@@ -306,26 +362,28 @@ def train(resume_g=None, resume_d=None, init_g=None, init_d=None, mel_subdir="me
             print(f"\nSaved: {g_path.name}, {d_path.name}  (g_latest/d_latest updated)")
 
             # optional off-machine backup — set HF_HIFIGAN_CKPT_REPO to push
-            # g_latest.pt/d_latest.pt to HuggingFace (ephemeral cloud instances)
+            # g_best.pt when it improved since the last save. latest/d stay
+            # local-only (session resume); the best generator is the artifact
+            # worth keeping off-machine.
             repo = os.environ.get("HF_HIFIGAN_CKPT_REPO")
-            if repo:
+            if repo and new_best_since_save:
                 try:
                     from huggingface_hub import HfApi
                     api = HfApi()
                     # delete before re-uploading — see train_fastspeech.py's
                     # save_checkpoint for why an in-place overwrite alone
                     # isn't enough to release the old version's storage
-                    for name in ("g_latest.pt", "d_latest.pt"):
-                        try:
-                            api.delete_file(name, repo_id=repo, repo_type="model")
-                        except Exception:
-                            pass
-                        api.upload_file(
-                            path_or_fileobj=str(paths.hifigan_ckpt_dir / name),
-                            path_in_repo=name,
-                            repo_id=repo, repo_type="model",
-                        )
+                    try:
+                        api.delete_file("g_best.pt", repo_id=repo, repo_type="model")
+                    except Exception:
+                        pass
+                    api.upload_file(
+                        path_or_fileobj=str(paths.hifigan_ckpt_dir / "g_best.pt"),
+                        path_in_repo="g_best.pt",
+                        repo_id=repo, repo_type="model",
+                    )
                     api.super_squash_history(repo, repo_type="model")
+                    new_best_since_save = False
                 except Exception as e:
                     print(f"\nHF checkpoint upload failed (continuing): {e}")
 
