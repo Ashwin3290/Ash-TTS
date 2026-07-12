@@ -34,6 +34,29 @@ def get_lr(step, d_model=mcfg.d_model, warmup=tcfg.warmup_steps):
     return d_model ** -0.5 * min(step ** -0.5, step * warmup ** -1.5)
 
 
+def build_optimizer(model, lr, weight_decay):
+    """
+    AdamW with decoupled weight decay, excluding biases and norm parameters —
+    decaying those doesn't regularise anything and is known to hurt training.
+    Two param groups: only the first carries weight_decay.
+    """
+    decay, no_decay = [], []
+    for name, p in model.named_parameters():
+        if not p.requires_grad:
+            continue
+        if name.endswith(".bias") or "norm" in name.lower():
+            no_decay.append(p)
+        else:
+            decay.append(p)
+    return torch.optim.AdamW(
+        [
+            {"params": decay, "weight_decay": weight_decay},
+            {"params": no_decay, "weight_decay": 0.0},
+        ],
+        lr=lr, betas=(0.9, 0.98), eps=1e-9,
+    )
+
+
 def save_checkpoint(step, model, optimizer, scheduler, scaler, ckpt_dir,
                      best_val_loss=None, is_best=False):
     ckpt_dir = Path(ckpt_dir)
@@ -148,8 +171,7 @@ def train(resume_path=None):
     model.variance_adaptor.set_stats(**stats)
     print(f"Model parameters: {model.count_parameters():,}")
 
-    optimizer = torch.optim.Adam(model.parameters(), lr=1.0, betas=(0.9, 0.98), eps=1e-9,
-                                  weight_decay=tcfg.weight_decay)
+    optimizer = build_optimizer(model, lr=1.0, weight_decay=tcfg.weight_decay)
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, get_lr)
     scaler    = GradScaler("cuda", enabled=tcfg.fp16)
 
@@ -158,13 +180,26 @@ def train(resume_path=None):
     if resume_path:
         ckpt = torch.load(resume_path, map_location=device)
         model.load_state_dict(ckpt["model"])
-        optimizer.load_state_dict(ckpt["optimizer"])
-        # override whatever weight_decay was saved in the old checkpoint —
-        # load_state_dict restores param_groups verbatim, so a config change
-        # (e.g. newly enabling weight decay) would otherwise be silently
-        # discarded on every resume
-        for group in optimizer.param_groups:
-            group["weight_decay"] = tcfg.weight_decay
+
+        # optimizer.load_state_dict maps saved state to current param_groups
+        # *positionally* (flattened parameter order), not by name — if the
+        # number of param_groups differs from what's saved (e.g. switching
+        # from a single-group Adam to this two-group decay/no-decay AdamW),
+        # a naive load silently assigns momentum buffers to the wrong
+        # parameters instead of erroring. Only restore optimizer state when
+        # the shape actually matches; otherwise start it fresh.
+        saved_opt = ckpt["optimizer"]
+        if len(saved_opt["param_groups"]) == len(optimizer.param_groups):
+            optimizer.load_state_dict(saved_opt)
+            # override the saved weight_decay so a config change takes effect
+            # on resume — group 0 = decay params, group 1 = no-decay (fixed
+            # order from build_optimizer)
+            optimizer.param_groups[0]["weight_decay"] = tcfg.weight_decay
+            optimizer.param_groups[1]["weight_decay"] = 0.0
+        else:
+            print(f"Optimizer structure changed ({len(saved_opt['param_groups'])} -> "
+                  f"{len(optimizer.param_groups)} param groups) — starting fresh "
+                  f"optimizer state (model weights still restored normally).")
         scheduler.load_state_dict(ckpt["scheduler"])
         if "scaler" in ckpt:
             scaler.load_state_dict(ckpt["scaler"])

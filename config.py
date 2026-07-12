@@ -56,10 +56,13 @@ class TrainFastSpeechConfig:
     max_steps: int = 300_000
     grad_clip: float = 0.5
     fp16: bool = True
-    # L2 regularisation — val loss climbed steadily past ~step 90k while train
-    # loss kept falling (overfitting). 1e-6 proved negligible in practice —
-    # went straight to something that actually changes the update.
-    weight_decay: float = 1e-4
+    # decoupled weight decay (AdamW) — val loss climbed steadily past ~step 90k
+    # while train loss kept falling (overfitting). Earlier attempts used plain
+    # Adam + L2 penalty applied to every parameter including biases/norms,
+    # which is known to regularise poorly (see Loshchilov & Hutter, the paper
+    # that introduced AdamW) and pushed val loss up further instead of down.
+    # 0.01 is AdamW's own default and a standard starting point.
+    weight_decay: float = 0.01
 
     # loss weights
     mel_loss_weight: float = 1.0
