@@ -46,3 +46,52 @@ class Decoder(nn.Module):
             x = layer(x, key_padding_mask=mask)
         x = self.norm(x)
         return self.linear(x)  # (B, T, n_mels)
+
+
+class PostNet(nn.Module):
+    """
+    Tacotron2-style residual refiner: 5 Conv1d layers over the mel channel axis
+    predicting a residual that is ADDED to the decoder's mel output
+    (mel_after = mel_before + postnet(mel_before)).
+
+    The final conv is zero-initialised, so a freshly constructed PostNet is an
+    exact identity (residual = 0). This means:
+      - checkpoints saved before the PostNet existed still load and produce
+        identical output (strict=False leaves the residual at zero), and
+      - warm-start fine-tuning begins from the backbone's converged operating
+        point instead of adding random noise to it.
+    """
+    def __init__(self):
+        super().__init__()
+        n_mels = acfg.n_mels
+        ch     = mcfg.postnet_channels
+        k      = mcfg.postnet_kernel
+        pad    = (k - 1) // 2
+        n      = mcfg.postnet_layers
+
+        convs = []
+        for i in range(n):
+            in_ch  = n_mels if i == 0 else ch
+            out_ch = n_mels if i == n - 1 else ch
+            convs.append(nn.Sequential(
+                nn.Conv1d(in_ch, out_ch, k, padding=pad),
+                nn.BatchNorm1d(out_ch),
+            ))
+        self.convs   = nn.ModuleList(convs)
+        self.dropout = nn.Dropout(mcfg.postnet_dropout)
+
+        nn.init.zeros_(self.convs[-1][0].weight)
+        nn.init.zeros_(self.convs[-1][0].bias)
+
+    def forward(self, x):
+        """
+        x: (B, T, n_mels) — decoder mel output
+        Returns: (B, T, n_mels) — residual to add to x
+        """
+        out = x.transpose(1, 2)                    # (B, n_mels, T) for Conv1d
+        for i, conv in enumerate(self.convs):
+            out = conv(out)
+            if i < len(self.convs) - 1:            # no tanh on the final layer
+                out = torch.tanh(out)
+            out = self.dropout(out)
+        return out.transpose(1, 2)                 # (B, T, n_mels)

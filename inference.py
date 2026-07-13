@@ -35,7 +35,7 @@ import soundfile as sf
 from pathlib import Path
 
 from config import audio as acfg, model as mcfg, hifigan as hcfg, paths
-from model.fastspeech2 import FastSpeech2
+from model.fastspeech2 import FastSpeech2, load_fs2_state
 from vocoder.generator import Generator, config_from_hcfg
 
 
@@ -90,7 +90,7 @@ def infer(text, fs2_ckpt, hifi_ckpt, output_path,
     # load FastSpeech2
     fs2 = FastSpeech2().to(device)
     ckpt = torch.load(fs2_ckpt, map_location=device)
-    fs2.load_state_dict(ckpt["model"])
+    load_fs2_state(fs2, ckpt["model"])
     fs2.eval()
 
     # load HiFi-GAN generator
@@ -111,7 +111,7 @@ def infer(text, fs2_ckpt, hifi_ckpt, output_path,
     ph_lens    = torch.tensor([len(phonemes)], dtype=torch.long).to(device)
 
     with torch.no_grad():
-        mel_pred, _, _, _, mel_lens = fs2(
+        _, mel_pred, _, _, _, mel_lens = fs2(   # mel_pred = PostNet-refined mel_after
             ph_tensor, ph_lens,
             duration_scale=1.0 / speed,   # slower speed = more frames per phoneme
             pitch_scale=pitch,
