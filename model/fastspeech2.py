@@ -54,9 +54,9 @@ class FastSpeech2(nn.Module):
             energy_scale=energy_scale,
         )
 
-        # 3. decode to mel, then refine with the PostNet residual
+        # 3. decode to mel (skip PostNet)
         mel_before = self.decoder(x, mel_lens)          # (B, T, n_mels)
-        mel_after  = mel_before + self.postnet(mel_before)
+        mel_after  = mel_before  # PostNet disabled — use decoder output directly
 
         return mel_before, mel_after, log_dur_pred, pitch_pred, energy_pred, mel_lens
 
