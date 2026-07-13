@@ -203,7 +203,8 @@ def find_resume_path(resume_arg, ckpt_dir):
     return resume_arg
 
 
-def train(resume_path=None, init_path=None):
+def train(resume_path=None, init_path=None, max_steps=None):
+    max_steps = max_steps or tcfg.max_steps
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
     if device.type == "cuda":
@@ -328,7 +329,7 @@ def train(resume_path=None, init_path=None):
     set_train_mode(model, phase)
     train_iter = iter(train_loader)
 
-    pbar = tqdm(range(start_step, tcfg.max_steps), initial=start_step, total=tcfg.max_steps)
+    pbar = tqdm(range(start_step, max_steps), initial=start_step, total=max_steps)
     for step in pbar:
         is_best = False
 
@@ -470,10 +471,15 @@ if __name__ == "__main__":
              "val mel L1 (metric-gated unfreeze), then everything fine-tunes "
              "at a low LR. Mutually exclusive with --resume."
     )
+    parser.add_argument(
+        "--max-steps", type=int, default=None,
+        help="Override config max_steps (useful for --init warm-start runs, "
+             "which restart the step counter at 0)."
+    )
     args = parser.parse_args()
     if args.init and args.resume:
         parser.error("--init and --resume are mutually exclusive: --init starts "
                      "a new run from a checkpoint's weights; --resume continues "
                      "an existing run (and restores its phase/baseline itself).")
     resume_path = find_resume_path(args.resume, paths.fastspeech_ckpt_dir)
-    train(resume_path=resume_path, init_path=args.init)
+    train(resume_path=resume_path, init_path=args.init, max_steps=args.max_steps)
