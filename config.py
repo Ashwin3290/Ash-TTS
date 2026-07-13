@@ -65,7 +65,7 @@ class TrainFastSpeechConfig:
     # (unlike the old uniform-duration runs, which bottomed out ~100k before
     # theirs). One more 250k block; best.pt tracking captures the optimum
     # wherever val loss actually bottoms out within it.
-    max_steps: int = 500_000
+    max_steps: int = 700_000
     grad_clip: float = 0.5
     fp16: bool = True
     # decoupled weight decay (AdamW) — val loss climbed steadily past ~step 90k
