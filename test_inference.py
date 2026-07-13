@@ -163,7 +163,7 @@ def main(utt_id, text, output_dir, hifi_ckpt=None):
             )
         except:
             hifi = load_pretrained_generator(
-                str("pretrained_hifigan" / "generator_v1"), str('pretrained_hifigan' / "config.json"), device
+                str("pretrained_hifigan/generator_v1"), str("pretrained_hifigan/config.json"), device
             ) 
 
         print("Vocoder: raw official generator_v1")
