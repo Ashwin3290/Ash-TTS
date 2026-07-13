@@ -36,7 +36,7 @@ from pathlib import Path
 from huggingface_hub import hf_hub_download
 
 from config import audio as acfg, hifigan as hcfg, paths
-from model.fastspeech2 import FastSpeech2
+from model.fastspeech2 import FastSpeech2, load_fs2_state
 from vocoder.generator import load_pretrained_generator
 from inference import text_to_phonemes, load_phoneme_vocab
 
@@ -93,7 +93,7 @@ def main(utt_id, text, output_dir, hifi_ckpt=None):
         stats = json.load(f)
     model = FastSpeech2().to(device)
     model.variance_adaptor.set_stats(**stats)
-    model.load_state_dict(ckpt["model"])
+    load_fs2_state(model, ckpt["model"])
     model.eval()
 
     gt_mel = None
@@ -118,7 +118,7 @@ def main(utt_id, text, output_dir, hifi_ckpt=None):
     ph_lens = torch.tensor([len(phonemes)], dtype=torch.long).to(device)
 
     with torch.no_grad():
-        mel_pred, _, _, _, mel_lens = model(ph_tensor, ph_lens)
+        _, mel_pred, _, _, _, mel_lens = model(ph_tensor, ph_lens)  # PostNet-refined mel_after
     pred_mel = mel_pred[0, :mel_lens[0].item()].cpu().numpy()  # (T, 80), normalised
     print(f"Predicted mel frames: {pred_mel.shape[0]} "
           f"({pred_mel.shape[0] * acfg.hop_length / acfg.sample_rate:.2f}s)")

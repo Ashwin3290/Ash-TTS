@@ -33,7 +33,7 @@ import soundfile as sf
 from pathlib import Path
 
 from config import audio as acfg, hifigan as hcfg, paths
-from model.fastspeech2 import FastSpeech2
+from model.fastspeech2 import FastSpeech2, load_fs2_state
 from vocoder.generator import Generator, config_from_hcfg
 from inference import text_to_phonemes, load_phoneme_vocab
 
@@ -60,7 +60,7 @@ def load_models(device):
     fs2 = FastSpeech2().to(device)
     fs2.variance_adaptor.set_stats(**stats)
     ckpt = torch.load(FS2_CKPT, map_location=device)
-    fs2.load_state_dict(ckpt["model"])
+    load_fs2_state(fs2, ckpt["model"])
     fs2.eval()
     print(f"FastSpeech2: step {ckpt.get('step', '?')}")
 
@@ -82,7 +82,7 @@ def synthesize(text, fs2, hifi, vocab, device, speed=1.0, pitch=1.0, energy=1.0)
     ph_lens = torch.tensor([len(phonemes)], dtype=torch.long).to(device)
 
     with torch.no_grad():
-        mel_pred, _, _, _, mel_lens = fs2(
+        _, mel_pred, _, _, _, mel_lens = fs2(   # mel_pred = PostNet-refined mel_after
             ph, ph_lens,
             duration_scale=1.0 / speed,
             pitch_scale=pitch,

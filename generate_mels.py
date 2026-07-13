@@ -28,7 +28,7 @@ from pathlib import Path
 from tqdm import tqdm
 
 from config import paths
-from model.fastspeech2 import FastSpeech2
+from model.fastspeech2 import FastSpeech2, load_fs2_state
 
 
 def main(ckpt_path):
@@ -40,7 +40,7 @@ def main(ckpt_path):
     model = FastSpeech2().to(device)
     model.variance_adaptor.set_stats(**stats)
     ckpt = torch.load(ckpt_path, map_location=device)
-    model.load_state_dict(ckpt["model"])
+    load_fs2_state(model, ckpt["model"])
     model.eval()
     print(f"Loaded {ckpt_path} (step {ckpt.get('step', '?')}, "
           f"best val loss {ckpt.get('best_val_loss')})")
@@ -69,7 +69,7 @@ def main(ckpt_path):
             ph_lens = torch.tensor([phonemes.size(1)], dtype=torch.long, device=device)
 
             # GT durations for frame alignment; pitch/energy left to the model
-            mel_pred, _, _, _, mel_lens = model(
+            _, mel_pred, _, _, _, mel_lens = model(   # PostNet-refined mel_after
                 phonemes, ph_lens, durations_gt=durations,
                 f0_gt=None, energy_gt=None,
             )
