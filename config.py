@@ -54,11 +54,11 @@ class TrainFastSpeechConfig:
     learning_rate: float = 1e-3
     warmup_steps: int = 1000
     # raised from 250k after the phone-level-duration run finished with its
-    # best checkpoint at step 245k — i.e. still improving at the ceiling,
+    # best checkpoint at step 245k — i.e. still improving at the ceiling
     # (unlike the old uniform-duration runs, which bottomed out ~100k before
-    # theirs). best.pt tracking makes a generous ceiling safe: the optimum is
-    # captured wherever val loss actually bottoms out.
-    max_steps: int = 400_000
+    # theirs). One more 250k block; best.pt tracking captures the optimum
+    # wherever val loss actually bottoms out within it.
+    max_steps: int = 500_000
     grad_clip: float = 0.5
     fp16: bool = True
     # decoupled weight decay (AdamW) — val loss climbed steadily past ~step 90k
