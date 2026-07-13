@@ -157,9 +157,15 @@ def main(utt_id, text, output_dir, hifi_ckpt=None):
         hifi.remove_weight_norm()
         print(f"Vocoder: fine-tuned checkpoint {hifi_ckpt} (step {hifi_state.get('step', '?')})")
     else:
-        hifi = load_pretrained_generator(
-            str(HIFIGAN_DIR / "generator_v1"), str(HIFIGAN_DIR / "config.json"), device
-        )
+        try:
+            hifi = load_pretrained_generator(
+                str(HIFIGAN_DIR / "generator_v1"), str(HIFIGAN_DIR / "config.json"), device
+            )
+        except:
+            hifi = load_pretrained_generator(
+                str("pretrained_hifigan" / "generator_v1"), str('pretrained_hifigan' / "config.json"), device
+            ) 
+
         print("Vocoder: raw official generator_v1")
     mel_for_vocoder = denorm_mel(pred_mel)
     mel_t = torch.from_numpy(mel_for_vocoder.T).float().unsqueeze(0).to(device)
