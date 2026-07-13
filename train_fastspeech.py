@@ -23,7 +23,8 @@ from tqdm import tqdm
 
 from config import train as tcfg, paths, audio as acfg, model as mcfg
 from data.dataset import get_loaders
-from model.fastspeech2 import FastSpeech2, masked_mse, duration_loss
+from model.fastspeech2 import (FastSpeech2, masked_mse, masked_l1,
+                               duration_loss, pitch_loss, energy_loss)
 
 SAVE_EVERY = 1000   # save every 1000 steps
 KEEP_LAST_N = 1      # step_*.pt checkpoints to retain besides latest.pt (each ~500MB)
@@ -32,6 +33,60 @@ KEEP_LAST_N = 1      # step_*.pt checkpoints to retain besides latest.pt (each ~
 def get_lr(step, d_model=mcfg.d_model, warmup=tcfg.warmup_steps):
     step = max(step, 1)
     return d_model ** -0.5 * min(step ** -0.5, step * warmup ** -1.5)
+
+
+def get_finetune_lr(step, warmup=tcfg.finetune_warmup):
+    """Flat LR with a short linear re-warmup, used after unfreezing the backbone.
+    Multiplies the optimizer's base lr (tcfg.finetune_lr)."""
+    return min(1.0, max(step, 1) / warmup)
+
+
+# During the frozen warm-start phase only these submodules train: the fresh
+# PostNet, plus the pitch/energy predictors (tiny, and they need to relearn
+# under the fixed pitch/energy losses anyway).
+FROZEN_PHASE_TRAINABLE = ("postnet.",
+                          "variance_adaptor.pitch_predictor.",
+                          "variance_adaptor.energy_predictor.")
+
+
+def set_frozen_phase(model, frozen: bool):
+    for name, p in model.named_parameters():
+        p.requires_grad = (not frozen) or name.startswith(FROZEN_PHASE_TRAINABLE)
+
+
+def set_train_mode(model, phase):
+    """model.train(), but during the frozen phase the frozen backbone stays in
+    eval() so its dropout is off — the PostNet must see the same mel_before it
+    will see at inference, not a noisier version of it."""
+    model.train()
+    if phase == "frozen":
+        model.encoder.eval()
+        model.decoder.eval()
+        model.variance_adaptor.duration_predictor.eval()
+
+
+def validate(model, val_loader, device):
+    """Returns (val_before_l1, val_after_l1): per-element masked L1 on the
+    decoder output and the PostNet output, teacher-forced like training."""
+    model.eval()
+    before, after = [], []
+    with torch.no_grad():
+        for vbatch in val_loader:
+            vph   = vbatch["phonemes"].to(device)
+            vmel  = vbatch["mel"].to(device)
+            vf0   = vbatch["f0"].to(device)
+            veng  = vbatch["energy"].to(device)
+            vdur  = vbatch["durations"].to(device)
+            vphl  = vbatch["ph_lens"].to(device)
+            vmell = vbatch["mel_lens"].to(device)
+            with autocast("cuda", enabled=tcfg.fp16):
+                mel_before, mel_after, _, _, _, _ = model(
+                    vph, vphl, durations_gt=vdur, f0_gt=vf0, energy_gt=veng)
+                T = min(mel_before.size(1), vmel.size(1))
+                lens = vmell.clamp(max=T)
+                before.append(masked_l1(mel_before[:, :T], vmel[:, :T], lens).item() / acfg.n_mels)
+                after.append(masked_l1(mel_after[:, :T],  vmel[:, :T], lens).item() / acfg.n_mels)
+    return sum(before) / len(before), sum(after) / len(after)
 
 
 def build_optimizer(model, lr, weight_decay):
@@ -58,7 +113,8 @@ def build_optimizer(model, lr, weight_decay):
 
 
 def save_checkpoint(step, model, optimizer, scheduler, scaler, ckpt_dir,
-                     best_val_loss=None, is_best=False):
+                     best_val_loss=None, is_best=False,
+                     phase="full", lr_mode="noam", baseline=None):
     ckpt_dir = Path(ckpt_dir)
     state = {
         "step":          step,
@@ -67,6 +123,11 @@ def save_checkpoint(step, model, optimizer, scheduler, scaler, ckpt_dir,
         "scheduler":     scheduler.state_dict(),
         "scaler":        scaler.state_dict(),
         "best_val_loss": best_val_loss,
+        # PostNet warm-start state — lets --resume restore the correct
+        # freeze phase, LR regime, and unfreeze-gate baseline
+        "phase":         phase,
+        "lr_mode":       lr_mode,
+        "baseline":      baseline,
     }
     ckpt_path = ckpt_dir / f"step_{step}.pt"
     torch.save(state, ckpt_path)
@@ -142,7 +203,7 @@ def find_resume_path(resume_arg, ckpt_dir):
     return resume_arg
 
 
-def train(resume_path=None):
+def train(resume_path=None, init_path=None):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
     if device.type == "cuda":
@@ -162,16 +223,57 @@ def train(resume_path=None):
     model.variance_adaptor.set_stats(**stats)
     print(f"Model parameters: {model.count_parameters():,}")
 
-    optimizer = build_optimizer(model, lr=1.0, weight_decay=tcfg.weight_decay)
-    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, get_lr)
-    scaler    = GradScaler("cuda", enabled=tcfg.fp16)
-
+    # ---- phase / LR-regime bookkeeping (PostNet warm-start) -----------------
+    # phase:   "frozen" = backbone frozen, only PostNet + pitch/energy predictors
+    #          train; "full" = everything trains.
+    # lr_mode: "noam" = transformer schedule (fresh runs and the frozen phase);
+    #          "finetune" = flat low LR + short re-warmup (after unfreezing).
+    # baseline: frozen backbone's own val mel_before L1 — the unfreeze gate
+    #          compares val mel_after L1 against it.
+    phase, lr_mode, baseline = "full", "noam", None
     start_step = 0
     best_val_loss = float("inf")
-    if resume_path:
+    ckpt = None
+
+    if init_path:
+        # warm start: model weights only (no optimizer/step state) from a
+        # checkpoint that may predate the PostNet
+        init_ckpt = torch.load(init_path, map_location=device)
+        state = init_ckpt.get("model", init_ckpt)
+        missing, unexpected = model.load_state_dict(state, strict=False)
+        bad_missing = [k for k in missing if not k.startswith("postnet.")]
+        if bad_missing or unexpected:
+            raise ValueError(f"--init checkpoint mismatch beyond the PostNet: "
+                             f"missing={bad_missing} unexpected={unexpected}")
+        if missing:
+            phase = "frozen"
+            print(f"Initialized from {init_path} — PostNet is fresh "
+                  f"({len(missing)} new keys), entering frozen warm-start phase.")
+        else:
+            print(f"Initialized from {init_path} (PostNet weights present — "
+                  f"training everything from step 0).")
+    elif resume_path:
         ckpt = torch.load(resume_path, map_location=device)
         model.load_state_dict(ckpt["model"])
+        phase    = ckpt.get("phase", "full")
+        lr_mode  = ckpt.get("lr_mode", "noam")
+        baseline = ckpt.get("baseline")
 
+    set_frozen_phase(model, frozen=(phase == "frozen"))
+
+    def build_opt_sched():
+        if lr_mode == "finetune":
+            opt = build_optimizer(model, lr=tcfg.finetune_lr, weight_decay=tcfg.weight_decay)
+            sched = torch.optim.lr_scheduler.LambdaLR(opt, get_finetune_lr)
+        else:
+            opt = build_optimizer(model, lr=1.0, weight_decay=tcfg.weight_decay)
+            sched = torch.optim.lr_scheduler.LambdaLR(opt, get_lr)
+        return opt, sched
+
+    optimizer, scheduler = build_opt_sched()
+    scaler = GradScaler("cuda", enabled=tcfg.fp16)
+
+    if ckpt is not None:
         # optimizer.load_state_dict maps saved state to current param_groups
         # *positionally* (flattened parameter order), not by name — if the
         # number of param_groups differs from what's saved (e.g. switching
@@ -180,7 +282,10 @@ def train(resume_path=None):
         # parameters instead of erroring. Only restore optimizer state when
         # the shape actually matches; otherwise start it fresh.
         saved_opt = ckpt["optimizer"]
-        structure_matches = len(saved_opt["param_groups"]) == len(optimizer.param_groups)
+        n_saved_params = sum(len(g["params"]) for g in saved_opt["param_groups"])
+        n_curr_params  = sum(len(g["params"]) for g in optimizer.param_groups)
+        structure_matches = (len(saved_opt["param_groups"]) == len(optimizer.param_groups)
+                             and n_saved_params == n_curr_params)
         if structure_matches:
             optimizer.load_state_dict(saved_opt)
             # override the saved weight_decay so a config change takes effect
@@ -190,25 +295,37 @@ def train(resume_path=None):
             optimizer.param_groups[1]["weight_decay"] = 0.0
             scheduler.load_state_dict(ckpt["scheduler"])
         else:
-            print(f"Optimizer structure changed ({len(saved_opt['param_groups'])} -> "
-                  f"{len(optimizer.param_groups)} param groups) — starting fresh "
-                  f"optimizer state (model weights still restored normally).")
+            print(f"Optimizer structure changed — starting fresh optimizer state "
+                  f"(model weights still restored normally).")
             # scheduler.load_state_dict would hit the same positional mismatch
             # (LambdaLR's base_lrs is sized to the OLD param_group count) — skip
             # it and manually fast-forward the scheduler/optimizer LR instead
             resume_step = ckpt["step"]
             scheduler.last_epoch = resume_step
+            lr_fn = get_finetune_lr if lr_mode == "finetune" else get_lr
+            base = tcfg.finetune_lr if lr_mode == "finetune" else 1.0
             for group in optimizer.param_groups:
-                group["lr"] = get_lr(resume_step)
+                group["lr"] = base * lr_fn(resume_step)
         if "scaler" in ckpt:
             scaler.load_state_dict(ckpt["scaler"])
         if ckpt.get("best_val_loss") is not None:
             best_val_loss = ckpt["best_val_loss"]
         start_step = ckpt["step"]
-        print(f"Resumed from step {start_step} (best val loss so far: {best_val_loss:.4f})")
+        print(f"Resumed from step {start_step} (phase={phase}, lr_mode={lr_mode}, "
+              f"best val loss so far: {best_val_loss:.4f})")
+
+    # unfreeze-gate baseline: the frozen backbone's own val mel_before L1.
+    # Measured once, before any training — this is "the current best
+    # checkpoint's" quality that the PostNet has to beat.
+    if phase == "frozen" and baseline is None:
+        print("Measuring frozen-backbone baseline (val mel_before L1)...")
+        baseline, base_after = validate(model, val_loader, device)
+        print(f"Baseline val mel_before L1/element: {baseline:.5f} "
+              f"(mel_after at init: {base_after:.5f}) — unfreeze when mel_after "
+              f"<= {baseline * tcfg.unfreeze_threshold:.5f}")
 
     running_loss = 0.0
-    model.train()
+    set_train_mode(model, phase)
     train_iter = iter(train_loader)
 
     pbar = tqdm(range(start_step, tcfg.max_steps), initial=start_step, total=tcfg.max_steps)
@@ -232,21 +349,25 @@ def train(resume_path=None):
         optimizer.zero_grad()
 
         with autocast("cuda",enabled=tcfg.fp16):
-            mel_pred, log_dur_pred, pitch_pred, energy_pred, _ = model(
+            mel_before, mel_after, log_dur_pred, pitch_pred, energy_pred, _ = model(
                 phonemes, ph_lens,
                 durations_gt=durations,
                 f0_gt=f0_gt,
                 energy_gt=energy_gt,
             )
 
-            T           = min(mel_pred.size(1), mel_gt.size(1))
+            T           = min(mel_before.size(1), mel_gt.size(1))
             capped_lens = mel_lens.clamp(max=T)
 
-            loss_mel    = masked_mse(mel_pred[:, :T], mel_gt[:, :T], capped_lens) * tcfg.mel_loss_weight
+            # MSE on the raw decoder output (same objective the backbone
+            # converged under), L1 on the PostNet output (less prone to
+            # conditional-mean blur — this is the sharpening signal)
+            loss_mel_before = masked_mse(mel_before[:, :T], mel_gt[:, :T], capped_lens)
+            loss_mel_after  = masked_l1(mel_after[:, :T],  mel_gt[:, :T], capped_lens)
+            loss_mel    = (loss_mel_before + loss_mel_after) * tcfg.mel_loss_weight
             loss_dur    = duration_loss(log_dur_pred, durations, ph_lens) * tcfg.duration_loss_weight
-            loss_pitch  = F.mse_loss(pitch_pred[:, :T] * (f0_gt[:, :T] != 0).float(),
-                                     f0_gt[:, :T]) * tcfg.pitch_loss_weight
-            loss_energy = F.mse_loss(energy_pred[:, :T], energy_gt[:, :T]) * tcfg.energy_loss_weight
+            loss_pitch  = pitch_loss(pitch_pred[:, :T], f0_gt[:, :T], capped_lens) * tcfg.pitch_loss_weight
+            loss_energy = energy_loss(energy_pred[:, :T], energy_gt[:, :T], capped_lens) * tcfg.energy_loss_weight
             loss        = loss_mel + loss_dur + loss_pitch + loss_energy
 
         scaler.scale(loss).backward()
@@ -270,6 +391,11 @@ def train(resume_path=None):
             })
             writer.add_scalar("train/loss",   avg_loss,           step + 1)
             writer.add_scalar("train/mel",    loss_mel.item(),    step + 1)
+            writer.add_scalar("train/mel_before_mse", loss_mel_before.item(), step + 1)
+            writer.add_scalar("train/mel_after_l1",   loss_mel_after.item(),  step + 1)
+            # per-element view — masked losses sum over the 80 mel channels
+            writer.add_scalar("train/mel_after_l1_per_elem",
+                              loss_mel_after.item() / acfg.n_mels, step + 1)
             writer.add_scalar("train/dur",    loss_dur.item(),    step + 1)
             writer.add_scalar("train/pitch",  loss_pitch.item(),  step + 1)
             writer.add_scalar("train/energy", loss_energy.item(), step + 1)
@@ -277,37 +403,48 @@ def train(resume_path=None):
             running_loss = 0.0
 
         if (step + 1) % tcfg.val_every == 0:
-            model.eval()
-            val_losses = []
-            with torch.no_grad():
-                for vbatch in val_loader:
-                    vph   = vbatch["phonemes"].to(device)
-                    vmel  = vbatch["mel"].to(device)
-                    vf0   = vbatch["f0"].to(device)
-                    veng  = vbatch["energy"].to(device)
-                    vdur  = vbatch["durations"].to(device)
-                    vphl  = vbatch["ph_lens"].to(device)
-                    vmell = vbatch["mel_lens"].to(device)
-                    with autocast("cuda", enabled=tcfg.fp16):
-                        vmel_pred, _, _, _, _ = model(
-                            vph, vphl, durations_gt=vdur, f0_gt=vf0, energy_gt=veng)
-                        T     = min(vmel_pred.size(1), vmel.size(1))
-                        vloss = masked_mse(vmel_pred[:, :T], vmel[:, :T], vmell.clamp(max=T))
-                    val_losses.append(vloss.item())
-            val_mel_loss = sum(val_losses) / len(val_losses)
-            print(f"\n[step {step+1}] val mel loss: {val_mel_loss:.4f}")
-            writer.add_scalar("val/mel_loss", val_mel_loss, step + 1)
-            if val_mel_loss < best_val_loss:
-                best_val_loss = val_mel_loss
+            val_before, val_after = validate(model, val_loader, device)
+            print(f"\n[step {step+1}] val mel L1/elem — before: {val_before:.5f}  "
+                  f"after: {val_after:.5f}")
+            writer.add_scalar("val/mel_before_l1", val_before, step + 1)
+            writer.add_scalar("val/mel_after_l1",  val_after,  step + 1)
+
+            # best.pt tracks the PostNet output — that's what inference uses
+            if val_after < best_val_loss:
+                best_val_loss = val_after
                 is_best = True
-                print(f"New best val loss: {best_val_loss:.4f}")
-            model.train()
+                print(f"New best val loss: {best_val_loss:.5f}")
+
+            # metric-gated unfreeze: leave the frozen phase once the PostNet
+            # output beats the frozen backbone's own baseline (or the safety
+            # cap is hit), then fine-tune everything at a low LR
+            if phase == "frozen":
+                gate_hit = baseline is not None and val_after <= baseline * tcfg.unfreeze_threshold
+                cap_hit  = (step + 1) >= tcfg.max_freeze_steps
+                if gate_hit or cap_hit:
+                    if cap_hit and not gate_hit:
+                        print(f"WARNING: unfreeze gate never triggered — PostNet "
+                              f"stalled at {val_after:.5f} vs target "
+                              f"{baseline * tcfg.unfreeze_threshold:.5f}. Forcing "
+                              f"unfreeze at the {tcfg.max_freeze_steps}-step cap.")
+                    else:
+                        print(f"Unfreeze gate hit at step {step+1}: mel_after "
+                              f"{val_after:.5f} <= baseline {baseline:.5f} * "
+                              f"{tcfg.unfreeze_threshold}. Unfreezing backbone.")
+                    phase, lr_mode = "full", "finetune"
+                    set_frozen_phase(model, frozen=False)
+                    optimizer = build_optimizer(model, lr=tcfg.finetune_lr,
+                                                weight_decay=tcfg.weight_decay)
+                    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, get_finetune_lr)
+
+            set_train_mode(model, phase)
 
         if (step + 1) % SAVE_EVERY == 0:
             ckpt_path = save_checkpoint(
                 step + 1, model, optimizer, scheduler, scaler,
                 paths.fastspeech_ckpt_dir,
                 best_val_loss=best_val_loss, is_best=is_best,
+                phase=phase, lr_mode=lr_mode, baseline=baseline,
             )
             suffix = "  (new best.pt saved)" if is_best else ""
             print(f"\nSaved: {ckpt_path.name}  (latest.pt updated){suffix}")
@@ -325,6 +462,18 @@ if __name__ == "__main__":
         help="Resume training. No value = auto-find latest.pt. "
              "Or pass a specific checkpoint path."
     )
+    parser.add_argument(
+        "--init", default=None,
+        help="Warm-start from a checkpoint (model weights only, fresh step "
+             "counter/optimizer). If the checkpoint predates the PostNet, the "
+             "backbone is frozen until the PostNet beats the checkpoint's own "
+             "val mel L1 (metric-gated unfreeze), then everything fine-tunes "
+             "at a low LR. Mutually exclusive with --resume."
+    )
     args = parser.parse_args()
+    if args.init and args.resume:
+        parser.error("--init and --resume are mutually exclusive: --init starts "
+                     "a new run from a checkpoint's weights; --resume continues "
+                     "an existing run (and restores its phase/baseline itself).")
     resume_path = find_resume_path(args.resume, paths.fastspeech_ckpt_dir)
-    train(resume_path=resume_path)
+    train(resume_path=resume_path, init_path=args.init)
