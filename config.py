@@ -53,11 +53,12 @@ class TrainFastSpeechConfig:
     batch_size: int = 16
     learning_rate: float = 1e-3
     warmup_steps: int = 1000
-    # 250k for the phone-level-duration retrain: the new duration targets are
-    # far harder than the old near-constant ones, so the model needs more
-    # budget than the 150k used before — best.pt tracking captures the true
-    # optimum regardless of where val loss bottoms out within this ceiling
-    max_steps: int = 250_000
+    # raised from 250k after the phone-level-duration run finished with its
+    # best checkpoint at step 245k — i.e. still improving at the ceiling,
+    # (unlike the old uniform-duration runs, which bottomed out ~100k before
+    # theirs). best.pt tracking makes a generous ceiling safe: the optimum is
+    # captured wherever val loss actually bottoms out.
+    max_steps: int = 400_000
     grad_clip: float = 0.5
     fp16: bool = True
     # decoupled weight decay (AdamW) — val loss climbed steadily past ~step 90k
@@ -100,9 +101,10 @@ class HiFiGANConfig:
     adam_b1: float = 0.8
     adam_b2: float = 0.99
     lr_decay: float = 0.999
-    # budget for the predicted-mel fine-tune pass (~1.7h at the observed
-    # ~4 it/s) — fine-tuning from already-adapted weights, not from scratch
-    max_steps: int = 25_000
+    # raised from 25k after the fine-tune finished with its best at step 22k
+    # (still improving at the ceiling); 50k also matches the official repo's
+    # fine-tuning budget more closely
+    max_steps: int = 50_000
     fp16: bool = True
 
     # audio segment for training — HiFi-GAN trains on fixed-length chunks, not full utterances
