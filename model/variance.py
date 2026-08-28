@@ -169,7 +169,7 @@ class VarianceAdaptor(nn.Module):
             mel_lens  = durations.sum(dim=1)
         else:
             # inference: convert predicted log-durations to frame counts
-            durations = (log_dur_pred.exp() * duration_scale).round().long().clamp(min=0)
+            durations = ((log_dur_pred.exp() - 1.0) * duration_scale).round().long().clamp(min=0)
             durations = durations * (torch.arange(durations.size(1), device=x.device).unsqueeze(0)
                                      < ph_lens.unsqueeze(1))  # zero out padding
             mel_lens = durations.sum(dim=1)
