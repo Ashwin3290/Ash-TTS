@@ -157,6 +157,62 @@ def build_phoneme_vocab(metadata_path, use_phonemizer=True):
     return vocab
 
 
+# ---- Silence alignment ----
+def _align_phonemes_with_textgrid(espeak_phonemes, textgrid_intervals, vocab):
+    """
+    Align espeak phoneme sequence with TextGrid intervals (which include silence).
+    Insert <sil> tokens at silence positions from TextGrid.
+
+    Strategy:
+    1. Extract speech intervals (non-silence) from TextGrid
+    2. If espeak phoneme count == speech interval count, use TextGrid durations
+    3. Insert <sil> tokens where TextGrid shows silence, in order
+
+    Returns: (phonemes_with_silence, durations) or (None, None) if alignment fails
+    """
+    sil_token = vocab.get("<sil>", 1)
+
+    # Separate speech and silence intervals
+    speech_intervals = [(ph, d) for ph, d in textgrid_intervals if ph not in ("", "sp", "sil", "spn")]
+    silence_intervals = [(ph, d) for ph, d in textgrid_intervals if ph in ("", "sp", "sil", "spn")]
+
+    # If espeak count matches speech count, we can align them
+    if len(espeak_phonemes) != len(speech_intervals):
+        # Mismatch — return None to skip this utterance
+        return None, None
+
+    if len(silence_intervals) == 0:
+        # No silences in TextGrid — just use espeak + TextGrid durations
+        durs = [d for _, d in speech_intervals]
+        return espeak_phonemes, np.array(durs, dtype=np.int32)
+
+    # Build phoneme sequence with silence tokens, matching TextGrid order
+    phonemes_out = []
+    durations_out = []
+    espeak_idx = 0
+
+    for ph, dur in textgrid_intervals:
+        if ph in ("", "sp", "sil", "spn"):
+            # Silence interval: insert <sil> token
+            phonemes_out.append(sil_token)
+            durations_out.append(dur)
+        else:
+            # Speech interval: consume next espeak phoneme
+            if espeak_idx < len(espeak_phonemes):
+                phonemes_out.append(espeak_phonemes[espeak_idx])
+                durations_out.append(dur)
+                espeak_idx += 1
+            else:
+                # More TextGrid intervals than espeak phonemes — shouldn't happen
+                return None, None
+
+    if espeak_idx != len(espeak_phonemes):
+        # Not all espeak phonemes were consumed — shouldn't happen
+        return None, None
+
+    return np.array(phonemes_out, dtype=np.int32), np.array(durations_out, dtype=np.int32)
+
+
 # ---- Per-utterance worker ----
 _GLOBALS = {}
 
@@ -216,11 +272,15 @@ def _process_one(args):
     if g["tg_dir"] is not None:
         tg_path = g["tg_dir"] / f"{utt_id}.TextGrid"
         if tg_path.exists():
-            intervals    = parse_textgrid(tg_path)
-            ph_intervals = [(ph, d) for ph, d in intervals if ph not in ("", "sp", "sil", "spn")]
-            durs         = [d for _, d in ph_intervals]
-            if len(durs) == len(phonemes):
-                durations = durs
+            intervals = parse_textgrid(tg_path)
+            # NEW: Preserve silence intervals by inserting <sil> tokens
+            # Align espeak phonemes with TextGrid, inserting silence where needed
+            phonemes_aligned, durations_aligned = _align_phonemes_with_textgrid(
+                phonemes, intervals, vocab
+            )
+            if phonemes_aligned is not None:
+                phonemes = phonemes_aligned
+                durations = durations_aligned
 
     pd = g["processed_dir"]
     np.save(pd / "mel"     / f"{utt_id}.npy", mel)
