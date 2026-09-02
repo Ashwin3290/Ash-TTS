@@ -18,7 +18,7 @@ from huggingface_hub import HfApi
 PROCESSED_DIR = Path("data/processed")
 DATA_DIR      = Path("data")
 PART_PREFIX   = "processed_part"
-DATASET_REPO  = "Ashwin-C9/tts-ljspeech-processed"
+DATASET_REPO  = "Ashwin-C9/tts-data-silence-fix"  # silence-fixed data
 MODEL_REPO    = "Ashwin-C9/tts-fastspeech2-ckpt"
 
 
@@ -62,16 +62,7 @@ def create_archive_parts(n_workers):
 def reset_and_upload_dataset(part_paths, n_workers):
     api = HfApi()
 
-    print(f"Deleting repo {DATASET_REPO}...")
-    try:
-        api.delete_repo(DATASET_REPO, repo_type="dataset")
-        print("  deleted.")
-    except Exception:
-        print("  repo did not exist, skipping delete.")
-
-    print(f"Creating repo {DATASET_REPO}...")
-    api.create_repo(DATASET_REPO, repo_type="dataset", private=True)
-    print("  created.")
+    print(f"Uploading to existing repo {DATASET_REPO}...")
 
     def upload_one(part_path):
         api.upload_file(
