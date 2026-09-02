@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Download model and data from HuggingFace for vast.ai training."""
+"""Download model and compressed data from HuggingFace for vast.ai training."""
 
 import os
 import sys
-import shutil
+import tarfile
 from pathlib import Path
 
 def main():
@@ -12,7 +12,7 @@ def main():
         print("ERROR: Set HF_TOKEN environment variable")
         sys.exit(1)
 
-    from huggingface_hub import hf_hub_download, snapshot_download
+    from huggingface_hub import hf_hub_download, list_repo_files
 
     HF_CKPT_REPO = "Ashwin-C9/tts-fastspeech2-ckpt"
     HF_DATA_REPO = "Ashwin-C9/tts-data-silence-fix"
@@ -39,56 +39,64 @@ def main():
         print(f"ERROR downloading model: {e}")
         sys.exit(1)
 
-    # Download dataset
+    # Download and extract dataset tar.gz files
     print(f"Downloading dataset from {HF_DATA_REPO}...")
     processed_dir = Path("data/processed")
-    temp_dir = Path("data/.hf_temp")
     processed_dir.mkdir(parents=True, exist_ok=True)
+    temp_dir = Path("data/.hf_temp")
     temp_dir.mkdir(parents=True, exist_ok=True)
 
     try:
-        # Download to temp dir first, then flatten structure
-        snapshot_download(
-            repo_id=HF_DATA_REPO,
-            local_dir=str(temp_dir),
-            repo_type="dataset",
-            token=token,
-        )
+        # List all tar.gz files in the repo
+        files = list_repo_files(HF_DATA_REPO, repo_type="dataset", token=token)
+        tar_files = sorted([f for f in files if f.startswith("processed_part") and f.endswith(".tar.gz")])
 
-        # Flatten: move files from temp to processed, preserving phoneme/duration dirs
-        for item in temp_dir.rglob("*"):
-            if item.is_file():
-                # Reconstruct path: if file is in phoneme/ or duration/, keep that structure
-                rel_path = item.relative_to(temp_dir)
-                target = processed_dir / rel_path
-                target.parent.mkdir(parents=True, exist_ok=True)
-                shutil.move(str(item), str(target))
-
-        # Clean up temp dir
-        shutil.rmtree(temp_dir)
-        print("✓ Dataset downloaded successfully")
-    except Exception as e:
-        print(f"ERROR downloading dataset: {e}")
-        sys.exit(1)
-
-    # Verify critical files exist
-    required_files = [
-        processed_dir / "train_manifest.json",
-        processed_dir / "val_manifest.json",
-    ]
-    for fpath in required_files:
-        if not fpath.exists():
-            print(f"ERROR: {fpath} not found after download")
+        if not tar_files:
+            print("ERROR: No processed_part*.tar.gz files found in dataset")
             sys.exit(1)
 
-    # Verify at least some phoneme and duration files exist
-    phoneme_files = list((processed_dir / "phoneme").glob("*.npy"))
-    duration_files = list((processed_dir / "duration").glob("*.npy"))
-    if not phoneme_files or not duration_files:
-        print(f"ERROR: Missing phoneme ({len(phoneme_files)} files) or duration ({len(duration_files)} files)")
-        sys.exit(1)
+        print(f"Found {len(tar_files)} tar.gz files, downloading and extracting...")
 
-    print(f"✓ Dataset complete: {len(phoneme_files)} phoneme files, {len(duration_files)} duration files")
+        for tar_file in tar_files:
+            print(f"  Downloading {tar_file}...")
+            tar_path = hf_hub_download(
+                repo_id=HF_DATA_REPO,
+                filename=tar_file,
+                local_dir=str(temp_dir),
+                repo_type="dataset",
+                token=token,
+            )
+
+            print(f"  Extracting {tar_file}...")
+            with tarfile.open(tar_path, "r:gz") as tar:
+                tar.extractall(path="data")
+
+        # Clean up temp dir
+        import shutil
+        shutil.rmtree(temp_dir)
+
+        # Verify critical files exist
+        if not (processed_dir / "train_manifest.json").exists():
+            print("ERROR: train_manifest.json not found after extraction")
+            sys.exit(1)
+        if not (processed_dir / "val_manifest.json").exists():
+            print("ERROR: val_manifest.json not found after extraction")
+            sys.exit(1)
+
+        # Verify data files
+        phoneme_files = list((processed_dir / "phoneme").glob("*.npy"))
+        duration_files = list((processed_dir / "duration").glob("*.npy"))
+        if not phoneme_files or not duration_files:
+            print(f"ERROR: Missing phoneme ({len(phoneme_files)} files) or duration ({len(duration_files)} files)")
+            sys.exit(1)
+
+        print(f"✓ Dataset complete: {len(phoneme_files)} phoneme files, {len(duration_files)} duration files")
+
+    except Exception as e:
+        print(f"ERROR downloading dataset: {e}")
+        import shutil
+        shutil.rmtree(temp_dir, ignore_errors=True)
+        sys.exit(1)
 
 if __name__ == "__main__":
     main()
