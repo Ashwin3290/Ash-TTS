@@ -26,14 +26,14 @@ echo "=== Stage 0: dependencies ==="
 pip install -q -r requirements.txt
 
 # Download from HuggingFace if needed (vast.ai only)
-export HF_DATA_REPO="${HF_DATA_REPO:-Ashwin-C9/tts-data-silence-fix}"
-if [ ! -f "$MARKERS/download_done" ]; then
-  if [ -f "download_vast.py" ]; then
-    echo "=== Stage 0b: download model & data from HuggingFace ==="
-    python download_vast.py
-    touch "$MARKERS/download_done"
-  fi
-fi
+# export HF_DATA_REPO="${HF_DATA_REPO:-Ashwin-C9/tts-data-silence-fix}"
+# if [ ! -f "$MARKERS/download_done" ]; then
+#   if [ -f "download_vast.py" ]; then
+#     echo "=== Stage 0b: download model & data from HuggingFace ==="
+#     python download_vast.py
+#     touch "$MARKERS/download_done"
+#   fi
+# fi
 
 if [ ! -f "$MARKERS/align_done" ]; then
   echo "=== Stage 1: phone-level re-alignment (overwrites all durations) ==="
