@@ -9,6 +9,9 @@ Usage:
 import os
 from pathlib import Path
 from huggingface_hub import HfApi
+from dotenv import load_dotenv
+
+load_dotenv()
 
 DATA_REPO = "Ashwin-C9/tts-data-silence-fix"
 MODEL_REPO = "Ashwin-C9/tts-fastspeech2-ckpt"
