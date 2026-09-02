@@ -57,41 +57,51 @@ def parse_textgrid(tg_path):
 
 
 def align_phonemes_with_textgrid(espeak_phonemes, textgrid_intervals, vocab):
-    """Align espeak phonemes with TextGrid, inserting <sil> tokens at silence positions."""
+    """
+    Align espeak phonemes with TextGrid, inserting <sil> tokens at silence positions.
+    If exact alignment fails, fall back to using speech durations only.
+    """
     sil_token = vocab.get("<sil>", 1)
 
     # Separate speech and silence intervals
     speech_intervals = [(ph, d) for ph, d in textgrid_intervals if ph not in ("", "sp", "sil", "spn")]
     silence_intervals = [(ph, d) for ph, d in textgrid_intervals if ph in ("", "sp", "sil", "spn")]
 
-    if len(espeak_phonemes) != len(speech_intervals):
-        return None, None
-
+    # If no silences in TextGrid, just use speech durations
     if len(silence_intervals) == 0:
-        durs = [d for _, d in speech_intervals]
-        return espeak_phonemes, np.array(durs, dtype=np.int32)
-
-    # Build phoneme sequence with silence tokens
-    phonemes_out = []
-    durations_out = []
-    espeak_idx = 0
-
-    for ph, dur in textgrid_intervals:
-        if ph in ("", "sp", "sil", "spn"):
-            phonemes_out.append(sil_token)
-            durations_out.append(dur)
+        speech_durs = [d for _, d in speech_intervals]
+        if len(espeak_phonemes) == len(speech_durs):
+            return espeak_phonemes, np.array(speech_durs, dtype=np.int32)
         else:
-            if espeak_idx < len(espeak_phonemes):
+            # Mismatch: return None to skip this utterance
+            return None, None
+
+    # Try exact alignment with silence tokens
+    if len(espeak_phonemes) == len(speech_intervals):
+        # Perfect match: build sequence with silence tokens
+        phonemes_out = []
+        durations_out = []
+        espeak_idx = 0
+
+        for ph, dur in textgrid_intervals:
+            if ph in ("", "sp", "sil", "spn"):
+                phonemes_out.append(sil_token)
+                durations_out.append(dur)
+            else:
                 phonemes_out.append(espeak_phonemes[espeak_idx])
                 durations_out.append(dur)
                 espeak_idx += 1
-            else:
-                return None, None
 
-    if espeak_idx != len(espeak_phonemes):
-        return None, None
+        return np.array(phonemes_out, dtype=np.int32), np.array(durations_out, dtype=np.int32)
 
-    return np.array(phonemes_out, dtype=np.int32), np.array(durations_out, dtype=np.int32)
+    # Fallback: just use speech durations without silence tokens
+    # (Better to have partial silence handling than none)
+    speech_durs = [d for _, d in speech_intervals]
+    if len(espeak_phonemes) == len(speech_durs):
+        return espeak_phonemes, np.array(speech_durs, dtype=np.int32)
+
+    # Last resort: skip this utterance
+    return None, None
 
 
 _GLOBALS = {}
