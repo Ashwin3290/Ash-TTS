@@ -3,6 +3,7 @@
 
 import os
 import sys
+import shutil
 from pathlib import Path
 
 def main():
@@ -41,16 +42,30 @@ def main():
     # Download dataset
     print(f"Downloading dataset from {HF_DATA_REPO}...")
     processed_dir = Path("data/processed")
+    temp_dir = Path("data/.hf_temp")
     processed_dir.mkdir(parents=True, exist_ok=True)
+    temp_dir.mkdir(parents=True, exist_ok=True)
 
     try:
-        # Download the entire repo (manifests + phoneme + duration)
+        # Download to temp dir first, then flatten structure
         snapshot_download(
             repo_id=HF_DATA_REPO,
-            local_dir=str(processed_dir),
+            local_dir=str(temp_dir),
             repo_type="dataset",
             token=token,
         )
+
+        # Flatten: move files from temp to processed, preserving phoneme/duration dirs
+        for item in temp_dir.rglob("*"):
+            if item.is_file():
+                # Reconstruct path: if file is in phoneme/ or duration/, keep that structure
+                rel_path = item.relative_to(temp_dir)
+                target = processed_dir / rel_path
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.move(str(item), str(target))
+
+        # Clean up temp dir
+        shutil.rmtree(temp_dir)
         print("✓ Dataset downloaded successfully")
     except Exception as e:
         print(f"ERROR downloading dataset: {e}")
