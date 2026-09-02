@@ -37,12 +37,7 @@ pip install -q -r requirements.txt
 if [ ! -f "$MARKERS/download_done" ]; then
   echo "=== Stage 1: download model & data from HuggingFace ==="
   python download_vast.py
-  if [ $? -ne 0 ]; then
-    echo "❌ Download failed"
-    exit 1
-  fi
   touch "$MARKERS/download_done"
-  echo "✓ Download stage complete"
 else
   echo "=== Stage 1: already done, skipping ==="
 fi
