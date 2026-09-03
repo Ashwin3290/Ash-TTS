@@ -64,7 +64,7 @@ class TrainFastSpeechConfig:
     # best checkpoint at step 245k — i.e. still improving at the ceiling
     # (unlike the old uniform-duration runs, which bottomed out ~100k before
     # theirs). Reduced to 100k for vast.ai budget constraints (~$2, ~12 hrs)
-    max_steps: int = 100_000
+    max_steps: int = 250_000
     grad_clip: float = 0.5
     fp16: bool = True
     # decoupled weight decay (AdamW) — val loss climbed steadily past ~step 90k
@@ -122,7 +122,7 @@ class HiFiGANConfig:
     # raised from 25k after the fine-tune finished with its best at step 22k
     # (still improving at the ceiling); 50k also matches the official repo's
     # fine-tuning budget more closely
-    max_steps: int = 50_000
+    max_steps: int = 100_000
     fp16: bool = True
 
     # audio segment for training — HiFi-GAN trains on fixed-length chunks, not full utterances
