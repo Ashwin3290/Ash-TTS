@@ -63,9 +63,8 @@ class TrainFastSpeechConfig:
     # raised from 250k after the phone-level-duration run finished with its
     # best checkpoint at step 245k — i.e. still improving at the ceiling
     # (unlike the old uniform-duration runs, which bottomed out ~100k before
-    # theirs). One more 250k block; best.pt tracking captures the optimum
-    # wherever val loss actually bottoms out within it.
-    max_steps: int = 700_000
+    # theirs). Reduced to 100k for vast.ai budget constraints (~$2, ~12 hrs)
+    max_steps: int = 100_000
     grad_clip: float = 0.5
     fp16: bool = True
     # decoupled weight decay (AdamW) — val loss climbed steadily past ~step 90k
