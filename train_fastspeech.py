@@ -24,6 +24,7 @@ from tqdm import tqdm
 from config import train as tcfg, paths, audio as acfg, model as mcfg
 from data.dataset import get_loaders
 from model.fastspeech2 import (FastSpeech2, masked_mse, masked_l1,
+                               masked_l1_silence_weighted,
                                duration_loss, pitch_loss, energy_loss)
 
 SAVE_EVERY = 1000   # save every 1000 steps
@@ -363,8 +364,12 @@ def train(resume_path=None, init_path=None, max_steps=None):
             # MSE on the raw decoder output (same objective the backbone
             # converged under), L1 on the PostNet output (less prone to
             # conditional-mean blur — this is the sharpening signal)
+            # Use silence-weighted L1 to prevent silence frames from being diluted in loss
             loss_mel_before = masked_mse(mel_before[:, :T], mel_gt[:, :T], capped_lens)
-            loss_mel_after  = masked_l1(mel_after[:, :T],  mel_gt[:, :T], capped_lens)
+            loss_mel_after  = masked_l1_silence_weighted(
+                mel_after[:, :T],  mel_gt[:, :T], capped_lens,
+                energy_gt=energy_gt[:, :T], silence_weight=2.0
+            )
             loss_mel    = (loss_mel_before + loss_mel_after) * tcfg.mel_loss_weight
             loss_dur    = duration_loss(log_dur_pred, durations, ph_lens) * tcfg.duration_loss_weight
             loss_pitch  = pitch_loss(pitch_pred[:, :T], f0_gt[:, :T], capped_lens) * tcfg.pitch_loss_weight

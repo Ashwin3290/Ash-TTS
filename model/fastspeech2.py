@@ -133,6 +133,30 @@ def energy_loss(energy_pred, energy_gt, lens):
     return loss.sum() / mask.sum().clamp(min=1)
 
 
+def masked_l1_silence_weighted(pred, target, lens, energy_gt=None, silence_weight=2.0):
+    """
+    L1 loss with higher weight on silence frames.
+    Silence frames (low energy) get higher gradient contribution to prevent
+    their loss from being diluted in the batch.
+
+    energy_gt: (B, T) normalized energy; silence has energy near -1
+    silence_weight: multiplier for silence frame loss (e.g., 2.0 = 2x weight)
+    """
+    B, T = pred.shape[:2]
+    mask = torch.arange(T, device=pred.device).unsqueeze(0) < lens.unsqueeze(1)
+    if pred.dim() == 3:
+        mask = mask.unsqueeze(-1)
+
+    # Reweight silence frames: energy < -0.5 is typically silence
+    frame_weights = torch.ones_like(mask, dtype=torch.float32)
+    if energy_gt is not None:
+        is_silence = (energy_gt < -0.5).unsqueeze(-1) if energy_gt.dim() == 2 else (energy_gt < -0.5)
+        frame_weights = torch.where(is_silence & mask, torch.tensor(silence_weight, device=frame_weights.device), frame_weights)
+
+    loss = (pred - target).abs() * mask * frame_weights
+    return loss.sum() / (mask * frame_weights).sum().clamp(min=1)
+
+
 def duration_loss(log_dur_pred, durations_gt, ph_lens):
     """
     L2 loss on log-durations. We predict log(duration+1) to prevent negative values.
