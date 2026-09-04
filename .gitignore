@@ -240,3 +240,4 @@ do_universal
 /test_output_*
 /.overnight
 *.wav
+_hf_staging
