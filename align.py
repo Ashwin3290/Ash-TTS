@@ -13,8 +13,19 @@ against a CTC model that emits espeak IPA phones — same inventory, verified
 1:1 coverage after stripping stress marks. Durations come from real acoustic
 evidence per phoneme, not uniform splitting.
 
-Reads phoneme ids straight from data/processed/phoneme/*.npy (no
-phonemizer/espeak needed at alignment time).
+<sil> tokens are re-derived from acoustic energy in the inter-phone gaps
+(head, mid-utterance, and tail), not from a TextGrid. The previous
+TextGrid + exact-espeak-count gate (regenerate_phonemes.py) silently
+dropped any utterance where espeak's phoneme count didn't match the
+TextGrid's speech-interval count exactly — on LJSpeech that kept only
+~6% of the data, and training on that starved, overfit set is what
+produced the monotonically-rising val loss this rewrite is fixing.
+Any <sil> a prior TextGrid pass already wrote into phoneme/*.npy is
+stripped and re-derived here instead of trusted.
+
+Reads phoneme ids and energy straight from data/processed/{phoneme,energy}/*.npy
+(no phonemizer/espeak needed at alignment time) and overwrites both the
+phoneme and duration files for each utterance it processes.
 
 Usage:
     python align.py
@@ -40,6 +51,9 @@ W2V_FRAME_SEC = W2V_HOP / ALIGN_SR
 MEL_FRAME_SEC = acfg.hop_length / acfg.sample_rate
 
 STRESS_MARKS = ("ˈ", "ˌ")      # ˈ primary, ˌ secondary
+
+MIN_SIL_W2V     = 6      # gap must be >= 6 emission frames (120ms) to become <sil>
+SIL_ENERGY_FRAC = 0.05   # and mean RMS over the gap < 5% of the utterance's max RMS
 
 
 def strip_stress(phone):
@@ -103,7 +117,21 @@ def distribute_to_frames(boundaries_sec, n_frames):
     return durations.tolist()
 
 
-def align_utterance(wav_path, aligner_ids, n_mel_frames, model, device, blank_id):
+def align_utterance(wav_path, ph_ids, aligner_ids, energy, n_mel_frames,
+                     model, device, blank_id, sil_id):
+    """Force-align ph_ids (no <sil>) against the wav2vec2 CTC emissions, then
+    re-derive <sil> tokens from acoustic energy in the inter-phone gaps —
+    instead of trusting a TextGrid's silence tier, which is what the old
+    exact-count gate did and which dropped ~94% of utterances that didn't
+    match espeak's phoneme count exactly.
+
+    A gap (head, inter-phone, or tail) becomes <sil> only if it's both long
+    enough (MIN_SIL_W2V emission frames) and quiet enough (mean RMS under
+    SIL_ENERGY_FRAC of the utterance's peak) — this keeps peaky-CTC blank
+    spans from being mislabelled as pauses.
+
+    Returns (phoneme_ids_with_sil, durations) or None.
+    """
     waveform, sr = torchaudio.load(str(wav_path))
     if sr != ALIGN_SR:
         waveform = torchaudio.functional.resample(waveform, sr, ALIGN_SR)
@@ -128,16 +156,46 @@ def align_utterance(wav_path, aligner_ids, n_mel_frames, model, device, blank_id
     if len(spans) != len(aligner_ids):
         return None
 
-    # boundary between phones i-1 and i = start of span i; inter-phone gaps
-    # (CTC blanks) therefore attach to the preceding phone. Head silence goes
-    # to the first phone, tail silence to the last.
     n_emission = emissions.size(1)
-    boundaries_sec = [0.0]
-    for span in spans[1:]:
-        boundaries_sec.append(span.start * W2V_FRAME_SEC)
-    boundaries_sec.append(n_emission * W2V_FRAME_SEC)
+    energy_max = energy.max() if len(energy) else 0.0
 
-    return distribute_to_frames(boundaries_sec, n_mel_frames)
+    def gap_is_silent(w2v_start, w2v_end):
+        if w2v_end - w2v_start < MIN_SIL_W2V or energy_max <= 0:
+            return False
+        a = int(w2v_start * W2V_FRAME_SEC / MEL_FRAME_SEC)
+        b = max(a + 1, int(w2v_end * W2V_FRAME_SEC / MEL_FRAME_SEC))
+        seg = energy[a:b]
+        if len(seg) == 0:
+            return False
+        return seg.mean() < SIL_ENERGY_FRAC * energy_max
+
+    # out_ids and frame_bounds grow in lockstep: frame_bounds always has
+    # exactly len(out_ids) + 1 entries, i.e. frame_bounds[k] is the start
+    # boundary of out_ids[k] and frame_bounds[k+1] is its end.
+    out_ids, frame_bounds = [], [0]
+
+    if gap_is_silent(0, spans[0].start):
+        out_ids.append(sil_id)
+        frame_bounds.append(spans[0].start)
+
+    for i, (pid, span) in enumerate(zip(ph_ids, spans)):
+        out_ids.append(int(pid))
+        gap_start = span.end + 1
+        gap_end   = spans[i + 1].start if i + 1 < len(spans) else n_emission
+        if gap_start < gap_end and gap_is_silent(gap_start, gap_end):
+            frame_bounds.append(gap_start)   # close this phone at the gap
+            out_ids.append(sil_id)
+            frame_bounds.append(gap_end)     # <sil> spans the rest of the gap
+        else:
+            frame_bounds.append(gap_end)     # phone absorbs the (non-silent) gap
+
+    frame_bounds[-1] = n_emission
+
+    boundaries_sec = [b * W2V_FRAME_SEC for b in frame_bounds]
+    durations = distribute_to_frames(boundaries_sec, n_mel_frames)
+    if durations is None or len(durations) != len(out_ids):
+        return None
+    return np.array(out_ids, dtype=np.int32), durations
 
 
 def run_alignment(data_root, processed_dir, overwrite=False, device=None):
@@ -147,6 +205,7 @@ def run_alignment(data_root, processed_dir, overwrite=False, device=None):
     dur_dir       = processed_dir / "duration"
     mel_dir       = processed_dir / "mel"
     ph_dir        = processed_dir / "phoneme"
+    energy_dir    = processed_dir / "energy"
     dur_dir.mkdir(parents=True, exist_ok=True)
 
     if device is None:
@@ -159,6 +218,7 @@ def run_alignment(data_root, processed_dir, overwrite=False, device=None):
     with open(processed_dir / "phoneme_vocab.json", encoding="utf-8") as f:
         vocab = json.load(f)
     inv_vocab = {v: k for k, v in vocab.items()}
+    sil_id = vocab["<sil>"]
 
     utt_ids = [f.stem for f in ph_dir.glob("*.npy")]
     print(f"Found {len(utt_ids)} preprocessed utterances")
@@ -199,26 +259,40 @@ def run_alignment(data_root, processed_dir, overwrite=False, device=None):
             continue
 
         ph_ids   = np.load(ph_dir / f"{utt_id}.npy")
+        # re-derive <sil> from acoustic energy below, not from whatever a
+        # prior TextGrid-based pass may have already baked into this file
+        ph_ids   = ph_ids[ph_ids != sil_id]
         n_frames = np.load(mel_path, mmap_mode="r").shape[0]
+        energy_path = energy_dir / f"{utt_id}.npy"
+        energy = np.load(energy_path) if energy_path.exists() else np.zeros(0, dtype=np.float32)
 
-        durations = None
+        if len(ph_ids) == 0:
+            failed += 1
+            continue
+
+        result = None
         aligner_ids = to_aligner_ids(ph_ids)
         if aligner_ids is not None:
             try:
-                durations = align_utterance(
-                    wav_path, aligner_ids, n_frames, model, device, blank_id)
+                result = align_utterance(
+                    wav_path, ph_ids, aligner_ids, energy, n_frames,
+                    model, device, blank_id, sil_id)
             except Exception:
-                durations = None
+                result = None
 
-        if durations is None:
+        if result is None:
             # uniform fallback — keeps the pipeline unblocked for the rare
-            # utterance the CTC path can't handle
+            # utterance the CTC path can't handle; no <sil> in this case
             n_ph = len(ph_ids)
             base = n_frames // n_ph
             rem  = n_frames % n_ph
             durations = [base + (1 if i < rem else 0) for i in range(n_ph)]
+            out_ids = ph_ids.astype(np.int32)
             fallback += 1
+        else:
+            out_ids, durations = result
 
+        np.save(ph_dir / f"{utt_id}.npy", out_ids)
         np.save(dur_dir / f"{utt_id}.npy", np.array(durations, dtype=np.int32))
         success += 1
 
