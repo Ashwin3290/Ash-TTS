@@ -31,11 +31,11 @@ COMMON = ["θ", "ᵻ", "s", "t", "n", "ð", "ˈɪ", "ə"]
 
 
 def embed_key(sd):
-    keys = [k for k in sd if "embed" in k and k.endswith("weight")]
+    keys = [k for k in sd if k.endswith("embedding.weight")
+            and "pitch" not in k and "energy" not in k]
     if len(keys) != 1:
-        raise RuntimeError(f"expected one embedding weight, found {keys}")
+        raise RuntimeError(f"expected one phoneme embedding weight, found {keys}")
     return keys[0]
-
 
 def load_sd(path):
     ckpt = torch.load(path, map_location="cpu")
