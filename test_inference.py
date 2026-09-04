@@ -85,11 +85,12 @@ def main(utt_id, text, output_dir, hifi_ckpt=None):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
 
-    ckpt_path = pull_best_checkpoint()
+    # ckpt_path = pull_best_checkpoint()
+    ckpt_path = paths.fastspeech_ckpt_dir / "best_hf.pt"
     ckpt = torch.load(ckpt_path, map_location=device)
     print(f"Checkpoint step: {ckpt['step']}")
 
-    with open(paths.processed_dir / "stats.json") as f:
+    with open(paths.processed_dir / "stats.json", encoding="utf-8") as f:
         stats = json.load(f)
     model = FastSpeech2().to(device)
     model.variance_adaptor.set_stats(**stats)

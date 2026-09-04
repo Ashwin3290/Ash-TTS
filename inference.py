@@ -46,7 +46,7 @@ def load_phoneme_vocab():
             f"Phoneme vocab not found at {vocab_path}. "
             "Run preprocess.py first."
         )
-    with open(vocab_path) as f:
+    with open(vocab_path, encoding="utf-8") as f:
         return json.load(f)
 
 
