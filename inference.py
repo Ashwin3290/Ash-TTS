@@ -7,19 +7,21 @@ Requires:
 
 Usage:
     # a checkpoint produced by train_hifigan.py (from-scratch or fine-tuned from
-    # pretrained weights) — trained on our normalised [-1,1] mel, so no denorm
+    # pretrained weights)
     python inference.py --text "Hello, this is a test." \
-                        --fs2-ckpt checkpoints/fastspeech2/step_300000.pt \
-                        --hifi-ckpt checkpoints/hifigan/g_step_500000.pt \
+                        --fs2-ckpt checkpoints/fastspeech2/best.pt \
+                        --hifi-ckpt checkpoints/hifigan/g_best.pt \
                         --output output.wav
 
-    # the RAW, untouched official checkpoint (generator_v1 / universal_v1),
-    # never fine-tuned on our data — still on its own natural-log mel scale,
-    # so this path denormalises before vocoding
+    # the RAW, untouched official checkpoint (generator_v1 / universal_v1)
     python inference.py --text "Hello, this is a test." \
-                        --fs2-ckpt checkpoints/fastspeech2/step_300000.pt \
+                        --fs2-ckpt checkpoints/fastspeech2/best.pt \
                         --hifi-ckpt generator_v1 --hifi-config config.json \
                         --raw-official-hifigan --output output.wav
+
+    # with a standalone PostNet from train_postnet.py applied to the mel
+    python inference.py --text "..." --fs2-ckpt ... --hifi-ckpt ... \
+                        --postnet-ckpt checkpoints/fastspeech2/postnet_only.pt
 
 Optional control knobs (all default 1.0):
     --speed   0.8   # slower speech
@@ -30,17 +32,32 @@ Optional control knobs (all default 1.0):
 import argparse
 import json
 import re
-import torch
+
 import numpy as np
 import soundfile as sf
-from pathlib import Path
+import torch
+import sys
+import os
+
+if sys.platform == "win32":
+    os.environ.setdefault(
+        "PHONEMIZER_ESPEAK_LIBRARY",
+        r"C:\Program Files\eSpeak NG\libespeak-ng.dll"
+    )
 
 from config import audio as acfg, model as mcfg, hifigan as hcfg, paths
 from model.fastspeech2 import FastSpeech2, load_fs2_state
+from model.decoder import PostNet
 from vocoder.generator import Generator, config_from_hcfg
 
-SENTENCE_END = re.compile(r'(?<=[.!?])\s+')
-CLAUSE_BREAK = re.compile(r'[,;:]')
+# split on sentence terminators, and on clause punctuation within a sentence
+SENTENCE_END = re.compile(r"(?<=[.!?])\s+")
+CLAUSE_BREAK = re.compile(r"[,;:]")
+
+# the acoustic model was trained on utterances under 10s (~860 frames); long
+# inputs run past both the positional-encoding buffer and anything the duration
+# predictor has seen, and the tail degrades. Chunk at <sil> boundaries instead.
+MAX_CHUNK_PHONEMES = 150
 
 
 def load_phoneme_vocab():
@@ -54,154 +71,175 @@ def load_phoneme_vocab():
         return json.load(f)
 
 
-def chunk_by_sil(ids, sil, max_len=150):
-    """Greedily split a phoneme-id list into chunks <= max_len, cutting only
-    at <sil> tokens. Each chunk keeps its trailing <sil>."""
+def denorm_mel(mel):
+    """Undo preprocess.py's [-1,1] normalisation -> natural-log mel scale.
+
+    Every vocoder path needs this. train_hifigan.py's WavMelDataset denormalises
+    before training, so a fine-tuned generator expects natural-log mel just like
+    the official pretrained one does.
+    """
+    return (mel + 1) / 2 * (acfg.mel_max - acfg.mel_min) + acfg.mel_min
+
+
+def chunk_by_sil(ids, sil_id, max_len=MAX_CHUNK_PHONEMES):
+    """Split a phoneme-id list into chunks of at most max_len, cutting only at
+    <sil> tokens so a chunk boundary always lands where a pause already is."""
     if len(ids) <= max_len:
         return [ids]
-    chunks, cur = [], []
+
     clauses, buf = [], []
     for i in ids:
         buf.append(i)
-        if i == sil:
-            clauses.append(buf); buf = []
+        if i == sil_id:
+            clauses.append(buf)
+            buf = []
     if buf:
-        clauses.append(buf + [sil])
-    for cl in clauses:
-        if cur and len(cur) + len(cl) > max_len:
-            chunks.append(cur); cur = []
-        cur += cl
+        clauses.append(buf + [sil_id])
+
+    chunks, cur = [], []
+    for clause in clauses:
+        if cur and len(cur) + len(clause) > max_len:
+            chunks.append(cur)
+            cur = []
+        cur += clause
     if cur:
         chunks.append(cur)
     return chunks
 
 
 def text_to_phonemes(text, vocab):
-    """Returns a list of phoneme-id lists, one per sentence.
-    <sil> is inserted at commas/semicolons/colons and at each sentence end,
-    matching the acoustic <sil> the model saw in training."""
+    """text -> list of phoneme-id chunks.
+
+    <sil> is inserted at clause punctuation and at the end of every sentence,
+    matching the acoustically-derived <sil> tokens the model was trained on.
+    Without this, punctuation has no effect on the output at all.
+    """
     from phonemizer.backend import EspeakBackend
     from phonemizer.separator import Separator
-    backend = EspeakBackend("en-us", preserve_punctuation=False, with_stress=True)
-    sep = Separator(phone=' ', word='| ', syllable='')
-    sil = vocab["<sil>"]
-    pad = vocab.get("<pad>", 0)
 
-    sentences = [s.strip() for s in SENTENCE_END.split(text) if s.strip()]
-    out = []
-    for sent in sentences:
-        clauses = [c.strip() for c in CLAUSE_BREAK.split(sent) if c.strip()]
+    backend = EspeakBackend("en-us", preserve_punctuation=False, with_stress=True)
+    # must match preprocess.py exactly: phone-level tokens, word marker stripped
+    sep = Separator(phone=" ", word="| ", syllable="")
+
+    sil_id = vocab["<sil>"]
+    pad_id = vocab.get("<pad>", 0)
+
+    chunks = []
+    for sentence in (s.strip() for s in SENTENCE_END.split(text)):
+        if not sentence:
+            continue
+        clauses = [c.strip() for c in CLAUSE_BREAK.split(sentence) if c.strip()]
+        if not clauses:
+            continue
         ph_strs = backend.phonemize(clauses, separator=sep)
+
         ids = []
         for i, ph_str in enumerate(ph_strs):
-            ids += [vocab.get(p, pad) for p in ph_str.replace('|', '').split() if p.strip()]
+            ids += [vocab.get(p, pad_id)
+                    for p in ph_str.replace("|", "").split() if p.strip()]
             if i < len(ph_strs) - 1:
-                ids.append(sil)
-        ids.append(sil)
-        if ids:
-            out.extend(chunk_by_sil(ids, sil))
-    return out
+                ids.append(sil_id)
+        ids.append(sil_id)
+        chunks.extend(chunk_by_sil(ids, sil_id))
+
+    return chunks
+
+
+def load_postnet(ckpt_path, device):
+    net = PostNet().to(device)
+    state = torch.load(ckpt_path, map_location=device)
+    net.load_state_dict(state["postnet"] if "postnet" in state else state)
+    net.eval()
+    print(f"PostNet: {ckpt_path} (step {state.get('step', '?')})")
+    return net
+
+
+def load_vocoder(hifi_ckpt, device, raw_official=False, hifi_config=None):
+    if raw_official:
+        if not hifi_config:
+            raise ValueError("--hifi-config is required with --raw-official-hifigan")
+        from vocoder.generator import load_pretrained_generator
+        return load_pretrained_generator(hifi_ckpt, hifi_config, device)
+
+    hifi = Generator(config_from_hcfg(hcfg)).to(device)
+    state = torch.load(hifi_ckpt, map_location=device)
+    hifi.load_state_dict(state["generator"])
+    hifi.eval()
+    hifi.remove_weight_norm()   # fuse weight norm for faster inference
+    return hifi
 
 
 def mel_to_wav(mel, generator, device):
-    """mel: (T, 80) numpy → wav: (T_wav,) numpy"""
-    mel_t = torch.from_numpy(mel.T).float().unsqueeze(0).to(device)  # (1, 80, T)
+    """mel: (T, 80) numpy on the natural-log scale → wav: (T_wav,) numpy"""
+    mel_t = torch.from_numpy(mel.T).float().unsqueeze(0).to(device)
     with torch.no_grad():
-        wav = generator(mel_t)  # (1, 1, T_wav)
+        wav = generator(mel_t)
     return wav.squeeze().cpu().numpy()
 
 
 def infer(text, fs2_ckpt, hifi_ckpt, output_path,
           speed=1.0, pitch=1.0, energy=1.0,
-          raw_official_hifigan=False, hifi_config=None):
+          raw_official_hifigan=False, hifi_config=None, postnet_ckpt=None):
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
 
     vocab = load_phoneme_vocab()
-    sentences = text_to_phonemes(text, vocab)
-    if not sentences:
+    chunks = text_to_phonemes(text, vocab)
+    if not chunks:
         raise ValueError("Phonemization produced empty sequence.")
-    print(f"{len(sentences)} sentence(s), {sum(len(s) for s in sentences)} phonemes")
+    print(f"{len(chunks)} chunk(s), {sum(len(c) for c in chunks)} phonemes total")
 
-    # load FastSpeech2
     fs2 = FastSpeech2().to(device)
     ckpt = torch.load(fs2_ckpt, map_location=device)
+    with open(paths.processed_dir / "stats.json") as f:
+        fs2.variance_adaptor.set_stats(**json.load(f))
     load_fs2_state(fs2, ckpt["model"])
     fs2.eval()
+    print(f"FastSpeech2: {fs2_ckpt} (step {ckpt.get('step', '?')})")
 
-    # load HiFi-GAN generator
-    if raw_official_hifigan:
-        if not hifi_config:
-            raise ValueError("--hifi-config is required with --raw-official-hifigan")
-        from vocoder.generator import load_pretrained_generator
-        hifi = load_pretrained_generator(hifi_ckpt, hifi_config, device)
-    else:
-        hifi = Generator(config_from_hcfg(hcfg)).to(device)
-        hifi_ckpt_data = torch.load(hifi_ckpt, map_location=device)
-        hifi.load_state_dict(hifi_ckpt_data["generator"])
-        hifi.eval()
-        hifi.remove_weight_norm()   # fuse weight norm for faster inference
+    postnet = load_postnet(postnet_ckpt, device) if postnet_ckpt else None
+    hifi = load_vocoder(hifi_ckpt, device, raw_official_hifigan, hifi_config)
 
-    # run FastSpeech2 + HiFi-GAN, one sentence at a time
     wavs = []
-    for phonemes in sentences:
-        ph_tensor = torch.tensor(phonemes, dtype=torch.long).unsqueeze(0).to(device)  # (1, L)
-        ph_lens   = torch.tensor([len(phonemes)], dtype=torch.long).to(device)
+    for phonemes in chunks:
+        ph_tensor = torch.tensor(phonemes, dtype=torch.long).unsqueeze(0).to(device)
+        ph_lens = torch.tensor([len(phonemes)], dtype=torch.long).to(device)
 
         with torch.no_grad():
-            _, mel_pred, _, _, _, mel_lens = fs2(   # mel_pred = PostNet-refined mel_after
+            _, mel_pred, _, _, _, mel_lens = fs2(
                 ph_tensor, ph_lens,
                 duration_scale=1.0 / speed,   # slower speed = more frames per phoneme
                 pitch_scale=pitch,
                 energy_scale=energy,
             )
+            if postnet is not None:
+                mel_pred = mel_pred + postnet(mel_pred)
 
-        mel = mel_pred[0, :mel_lens[0].item()].cpu().numpy()  # (T, 80)
-
-        if raw_official_hifigan:
-            # the untouched official checkpoint expects raw natural-log mel, not
-            # our [-1,1] normalised training scale — denormalise before vocoding
-            mel = (mel + 1) / 2 * (acfg.mel_max - acfg.mel_min) + acfg.mel_min
-        # else: any checkpoint from train_hifigan.py (from-scratch or fine-tuned)
-        # was trained on our normalised mels, so no denorm needed here.
-
-        wavs.append(mel_to_wav(mel, hifi, device))
+        mel = mel_pred[0, :mel_lens[0].item()].cpu().numpy()   # (T, 80), normalised
+        wavs.append(mel_to_wav(denorm_mel(mel), hifi, device))
 
     wav = np.concatenate(wavs)
-    print(f"Total: {len(wav) / acfg.sample_rate:.2f}s")
-
-    # save
-    output_path = Path(output_path)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    sf.write(str(output_path), wav, acfg.sample_rate)
-    print(f"Saved: {output_path}  ({len(wav) / acfg.sample_rate:.2f}s at {acfg.sample_rate}Hz)")
+    sf.write(output_path, wav, acfg.sample_rate)
+    print(f"Saved {output_path}  ({len(wav) / acfg.sample_rate:.2f}s)")
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--text",      required=True)
-    parser.add_argument("--fs2-ckpt",  required=True)
-    parser.add_argument("--hifi-ckpt", required=True)
-    parser.add_argument("--hifi-config", default=None,
-                        help="Required with --raw-official-hifigan (official config.json)")
-    parser.add_argument("--raw-official-hifigan", action="store_true",
-                        help="Load the untouched official jik876/hifi-gan checkpoint "
-                             "(not fine-tuned) instead of a train_hifigan.py checkpoint")
-    parser.add_argument("--output",    default="output.wav")
-    parser.add_argument("--speed",     type=float, default=1.0)
-    parser.add_argument("--pitch",     type=float, default=1.0)
-    parser.add_argument("--energy",    type=float, default=1.0)
-    args = parser.parse_args()
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--text", required=True)
+    ap.add_argument("--fs2-ckpt", required=True)
+    ap.add_argument("--hifi-ckpt", required=True)
+    ap.add_argument("--hifi-config", default=None)
+    ap.add_argument("--raw-official-hifigan", action="store_true")
+    ap.add_argument("--postnet-ckpt", default=None,
+                    help="Standalone PostNet from train_postnet.py")
+    ap.add_argument("--output", default="output.wav")
+    ap.add_argument("--speed", type=float, default=1.0)
+    ap.add_argument("--pitch", type=float, default=1.0)
+    ap.add_argument("--energy", type=float, default=1.0)
+    args = ap.parse_args()
 
-    infer(
-        text=args.text,
-        fs2_ckpt=args.fs2_ckpt,
-        hifi_ckpt=args.hifi_ckpt,
-        output_path=args.output,
-        speed=args.speed,
-        pitch=args.pitch,
-        energy=args.energy,
-        raw_official_hifigan=args.raw_official_hifigan,
-        hifi_config=args.hifi_config,
-    )
+    infer(args.text, args.fs2_ckpt, args.hifi_ckpt, args.output,
+          speed=args.speed, pitch=args.pitch, energy=args.energy,
+          raw_official_hifigan=args.raw_official_hifigan,
+          hifi_config=args.hifi_config, postnet_ckpt=args.postnet_ckpt)

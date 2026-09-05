@@ -10,7 +10,11 @@ For each utterance in the train+val manifests:
   - forward best.pt with GROUND-TRUTH durations (keeps the predicted mel
     frame-aligned with the real audio) but PREDICTED pitch/energy (keeps
     the mel distribution close to real inference conditions)
+  - optionally apply a standalone PostNet from train_postnet.py
   - save the normalised [-1,1] predicted mel to data/processed/mel_pred/
+
+Pass --postnet-ckpt whenever the PostNet is part of the inference path, or the
+vocoder gets fine-tuned on a mel distribution it will never actually see.
 
 Uses cached phoneme ids from data/processed/phoneme/ — no phonemizer or
 espeak needed, so this runs on the cloud box as-is.
@@ -18,6 +22,7 @@ espeak needed, so this runs on the cloud box as-is.
 Usage:
     python generate_mels.py
     python generate_mels.py --ckpt checkpoints/fastspeech2/best.pt
+    python generate_mels.py --postnet-ckpt checkpoints/fastspeech2/postnet_only.pt
 """
 
 import argparse
@@ -29,9 +34,10 @@ from tqdm import tqdm
 
 from config import paths
 from model.fastspeech2 import FastSpeech2, load_fs2_state
+from model.decoder import PostNet
 
 
-def main(ckpt_path):
+def main(ckpt_path, postnet_ckpt=None):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
 
@@ -44,6 +50,15 @@ def main(ckpt_path):
     model.eval()
     print(f"Loaded {ckpt_path} (step {ckpt.get('step', '?')}, "
           f"best val loss {ckpt.get('best_val_loss')})")
+
+    postnet = None
+    if postnet_ckpt:
+        postnet = PostNet().to(device)
+        state = torch.load(postnet_ckpt, map_location=device)
+        postnet.load_state_dict(state["postnet"] if "postnet" in state else state)
+        postnet.eval()
+        print(f"PostNet: {postnet_ckpt} (step {state.get('step', '?')}, "
+              f"val_after {state.get('val_after')})")
 
     manifest = []
     for name in ("train_manifest.json", "val_manifest.json"):
@@ -69,10 +84,13 @@ def main(ckpt_path):
             ph_lens = torch.tensor([phonemes.size(1)], dtype=torch.long, device=device)
 
             # GT durations for frame alignment; pitch/energy left to the model
-            _, mel_pred, _, _, _, mel_lens = model(   # PostNet-refined mel_after
+            _, mel_pred, _, _, _, mel_lens = model(
                 phonemes, ph_lens, durations_gt=durations,
                 f0_gt=None, energy_gt=None,
             )
+            if postnet is not None:
+                mel_pred = mel_pred + postnet(mel_pred)
+
             mel = mel_pred[0, :mel_lens[0].item()].cpu().numpy().astype(np.float32)
             np.save(out_dir / f"{utt_id}.npy", mel)
 
@@ -82,5 +100,7 @@ def main(ckpt_path):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--ckpt", default="checkpoints/fastspeech2/best.pt")
+    parser.add_argument("--postnet-ckpt", default=None,
+                        help="Standalone PostNet from train_postnet.py")
     args = parser.parse_args()
-    main(ckpt_path=args.ckpt)
+    main(ckpt_path=args.ckpt, postnet_ckpt=args.postnet_ckpt)

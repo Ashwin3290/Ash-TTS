@@ -1,3 +1,25 @@
+"""
+Train the PostNet on its own, decoupled from FastSpeech2.
+
+Inputs are cached pairs produced by generate_mels.py:
+    data/processed/mel_pred/<id>.npy   FastSpeech2 output, teacher-forced durations
+    data/processed/mel/<id>.npy        ground truth
+Both are on the [-1, 1] normalised scale and frame-aligned, so this is a plain
+supervised residual regression: minimise L1(mel_pred + postnet(mel_pred), mel_gt).
+
+FastSpeech2 is never loaded, so a run is minutes rather than hours. The saved
+checkpoint holds only the postnet.* weights and can either be applied at
+inference time (inference.py --postnet-ckpt) or folded into a FastSpeech2
+checkpoint later.
+
+Usage:
+    python train_postnet.py --steps 6000
+    python train_postnet.py --steps 6000 --out checkpoints/fastspeech2/postnet_only.pt
+
+Decision rule after the run: the printed gain is the val L1 improvement over
+doing nothing. Under 1% means the PostNet is not worth carrying.
+"""
+
 import argparse
 import json
 
