@@ -29,6 +29,7 @@ Optional control knobs (all default 1.0):
 
 import argparse
 import json
+import re
 import torch
 import numpy as np
 import soundfile as sf
@@ -37,6 +38,9 @@ from pathlib import Path
 from config import audio as acfg, model as mcfg, hifigan as hcfg, paths
 from model.fastspeech2 import FastSpeech2, load_fs2_state
 from vocoder.generator import Generator, config_from_hcfg
+
+SENTENCE_END = re.compile(r'(?<=[.!?])\s+')
+CLAUSE_BREAK = re.compile(r'[,;:]')
 
 
 def load_phoneme_vocab():
@@ -50,20 +54,53 @@ def load_phoneme_vocab():
         return json.load(f)
 
 
+def chunk_by_sil(ids, sil, max_len=150):
+    """Greedily split a phoneme-id list into chunks <= max_len, cutting only
+    at <sil> tokens. Each chunk keeps its trailing <sil>."""
+    if len(ids) <= max_len:
+        return [ids]
+    chunks, cur = [], []
+    clauses, buf = [], []
+    for i in ids:
+        buf.append(i)
+        if i == sil:
+            clauses.append(buf); buf = []
+    if buf:
+        clauses.append(buf + [sil])
+    for cl in clauses:
+        if cur and len(cur) + len(cl) > max_len:
+            chunks.append(cur); cur = []
+        cur += cl
+    if cur:
+        chunks.append(cur)
+    return chunks
+
+
 def text_to_phonemes(text, vocab):
-    try:
-        from phonemizer.backend import EspeakBackend
-        from phonemizer.separator import Separator
-        backend = EspeakBackend("en-us", preserve_punctuation=False, with_stress=True)
-        # must match preprocess.py exactly: phone-level tokens, word marker stripped
-        sep = Separator(phone=' ', word='| ', syllable='')
-        ph_str = backend.phonemize([text], separator=sep)[0]
-        phonemes = [vocab.get(p, vocab.get("<pad>", 0))
-                    for p in ph_str.replace('|', '').split() if p.strip()]
-    except ImportError:
-        print("WARNING: phonemizer not available, falling back to character-level")
-        phonemes = [vocab.get(c, vocab.get("<pad>", 0)) for c in text]
-    return phonemes
+    """Returns a list of phoneme-id lists, one per sentence.
+    <sil> is inserted at commas/semicolons/colons and at each sentence end,
+    matching the acoustic <sil> the model saw in training."""
+    from phonemizer.backend import EspeakBackend
+    from phonemizer.separator import Separator
+    backend = EspeakBackend("en-us", preserve_punctuation=False, with_stress=True)
+    sep = Separator(phone=' ', word='| ', syllable='')
+    sil = vocab["<sil>"]
+    pad = vocab.get("<pad>", 0)
+
+    sentences = [s.strip() for s in SENTENCE_END.split(text) if s.strip()]
+    out = []
+    for sent in sentences:
+        clauses = [c.strip() for c in CLAUSE_BREAK.split(sent) if c.strip()]
+        ph_strs = backend.phonemize(clauses, separator=sep)
+        ids = []
+        for i, ph_str in enumerate(ph_strs):
+            ids += [vocab.get(p, pad) for p in ph_str.replace('|', '').split() if p.strip()]
+            if i < len(ph_strs) - 1:
+                ids.append(sil)
+        ids.append(sil)
+        if ids:
+            out.extend(chunk_by_sil(ids, sil))
+    return out
 
 
 def mel_to_wav(mel, generator, device):
@@ -82,10 +119,10 @@ def infer(text, fs2_ckpt, hifi_ckpt, output_path,
     print(f"Device: {device}")
 
     vocab = load_phoneme_vocab()
-    phonemes = text_to_phonemes(text, vocab)
-    if not phonemes:
+    sentences = text_to_phonemes(text, vocab)
+    if not sentences:
         raise ValueError("Phonemization produced empty sequence.")
-    print(f"Phoneme count: {len(phonemes)}")
+    print(f"{len(sentences)} sentence(s), {sum(len(s) for s in sentences)} phonemes")
 
     # load FastSpeech2
     fs2 = FastSpeech2().to(device)
@@ -106,30 +143,33 @@ def infer(text, fs2_ckpt, hifi_ckpt, output_path,
         hifi.eval()
         hifi.remove_weight_norm()   # fuse weight norm for faster inference
 
-    # run FastSpeech2
-    ph_tensor  = torch.tensor(phonemes, dtype=torch.long).unsqueeze(0).to(device)  # (1, L)
-    ph_lens    = torch.tensor([len(phonemes)], dtype=torch.long).to(device)
+    # run FastSpeech2 + HiFi-GAN, one sentence at a time
+    wavs = []
+    for phonemes in sentences:
+        ph_tensor = torch.tensor(phonemes, dtype=torch.long).unsqueeze(0).to(device)  # (1, L)
+        ph_lens   = torch.tensor([len(phonemes)], dtype=torch.long).to(device)
 
-    with torch.no_grad():
-        _, mel_pred, _, _, _, mel_lens = fs2(   # mel_pred = PostNet-refined mel_after
-            ph_tensor, ph_lens,
-            duration_scale=1.0 / speed,   # slower speed = more frames per phoneme
-            pitch_scale=pitch,
-            energy_scale=energy,
-        )
+        with torch.no_grad():
+            _, mel_pred, _, _, _, mel_lens = fs2(   # mel_pred = PostNet-refined mel_after
+                ph_tensor, ph_lens,
+                duration_scale=1.0 / speed,   # slower speed = more frames per phoneme
+                pitch_scale=pitch,
+                energy_scale=energy,
+            )
 
-    mel = mel_pred[0, :mel_lens[0].item()].cpu().numpy()  # (T, 80)
-    print(f"Mel frames: {mel.shape[0]}  ({mel.shape[0] * acfg.hop_length / acfg.sample_rate:.2f}s)")
+        mel = mel_pred[0, :mel_lens[0].item()].cpu().numpy()  # (T, 80)
 
-    if raw_official_hifigan:
-        # the untouched official checkpoint expects raw natural-log mel, not
-        # our [-1,1] normalised training scale — denormalise before vocoding
-        mel = (mel + 1) / 2 * (acfg.mel_max - acfg.mel_min) + acfg.mel_min
-    # else: any checkpoint from train_hifigan.py (from-scratch or fine-tuned)
-    # was trained on our normalised mels, so no denorm needed here.
+        if raw_official_hifigan:
+            # the untouched official checkpoint expects raw natural-log mel, not
+            # our [-1,1] normalised training scale — denormalise before vocoding
+            mel = (mel + 1) / 2 * (acfg.mel_max - acfg.mel_min) + acfg.mel_min
+        # else: any checkpoint from train_hifigan.py (from-scratch or fine-tuned)
+        # was trained on our normalised mels, so no denorm needed here.
 
-    # run HiFi-GAN
-    wav = mel_to_wav(mel, hifi, device)
+        wavs.append(mel_to_wav(mel, hifi, device))
+
+    wav = np.concatenate(wavs)
+    print(f"Total: {len(wav) / acfg.sample_rate:.2f}s")
 
     # save
     output_path = Path(output_path)
