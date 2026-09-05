@@ -13,7 +13,7 @@ import torch.nn as nn
 
 from model.encoder  import Encoder
 from model.variance import VarianceAdaptor
-from model.decoder  import Decoder, PostNet
+from model.decoder  import Decoder
 from config import model as mcfg, audio as acfg
 
 
@@ -23,7 +23,6 @@ class FastSpeech2(nn.Module):
         self.encoder          = Encoder()
         self.variance_adaptor = VarianceAdaptor()
         self.decoder          = Decoder()
-        self.postnet          = PostNet()
 
     def forward(self, phonemes, ph_lens,
                 durations_gt=None, f0_gt=None, energy_gt=None,
@@ -33,8 +32,7 @@ class FastSpeech2(nn.Module):
         Inference:  pass only phonemes + ph_lens, use *_scale knobs
 
         Returns:
-          mel_before:   (B, T, n_mels) — raw decoder output
-          mel_after:    (B, T, n_mels) — mel_before + PostNet residual (use this)
+          mel:          (B, T, n_mels) — decoder output
           log_dur_pred: (B, L)
           pitch_pred:   (B, T)
           energy_pred:  (B, T)
@@ -54,11 +52,10 @@ class FastSpeech2(nn.Module):
             energy_scale=energy_scale,
         )
 
-        # 3. decode to mel (skip PostNet)
-        mel_before = self.decoder(x, mel_lens)          # (B, T, n_mels)
-        mel_after  = mel_before  # PostNet disabled — use decoder output directly
+        # 3. decode to mel
+        mel = self.decoder(x, mel_lens)          # (B, T, n_mels)
 
-        return mel_before, mel_after, log_dur_pred, pitch_pred, energy_pred, mel_lens
+        return mel, log_dur_pred, pitch_pred, energy_pred, mel_lens
 
     def count_parameters(self):
         return sum(p.numel() for p in self.parameters() if p.requires_grad)
@@ -66,18 +63,15 @@ class FastSpeech2(nn.Module):
 
 def load_fs2_state(model, state):
     """
-    Load a FastSpeech2 state dict, tolerating checkpoints saved before the
-    PostNet existed. The PostNet's final conv is zero-initialised, so with its
-    weights absent mel_after == mel_before exactly — old checkpoints keep
-    producing their original output. Any other mismatch is a real error.
+    Load a FastSpeech2 state dict, dropping any postnet.* keys from
+    checkpoints saved before the PostNet became a separate training stage
+    (see train_postnet.py) — the joint in-model PostNet no longer exists.
+    Any other mismatch is a real error.
     """
+    state = {k: v for k, v in state.items() if not k.startswith("postnet.")}
     missing, unexpected = model.load_state_dict(state, strict=False)
-    bad = [k for k in missing if not k.startswith("postnet.")]
-    if bad or unexpected:
-        raise RuntimeError(f"Checkpoint mismatch: missing={bad} unexpected={unexpected}")
-    if missing:
-        print("Note: checkpoint predates the PostNet — it stays at its zero-init "
-              "identity (mel_after == mel_before).")
+    if missing or unexpected:
+        raise RuntimeError(f"Checkpoint mismatch: missing={missing} unexpected={unexpected}")
     return model
 
 
@@ -100,8 +94,6 @@ def masked_l1(pred, target, lens):
     L1 loss that ignores padding positions. Same normalisation as masked_mse
     (divides by valid FRAME count, so the value is summed over mel channels —
     divide by n_mels for a per-element number).
-    L1 is used on mel_after: it penalises the conditional-mean blur that L2
-    converges to less severely, giving sharper harmonic detail.
     """
     B, T = pred.shape[:2]
     mask = torch.arange(T, device=pred.device).unsqueeze(0) < lens.unsqueeze(1)  # (B, T)

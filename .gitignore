@@ -228,6 +228,7 @@ data/.filelist_*.txt
 # model checkpoints and pretrained weights — too large for git, tracked via HF hub instead
 checkpoints/
 GAN model/
+GAN_model/
 pretrained_hifigan/
 *.pt
 *.pth
@@ -238,7 +239,5 @@ do_universal
 /logs
 /test_output
 /test_output_*
-/.overnight
 *.wav
 _hf_staging
-GAN_model/do_02500000

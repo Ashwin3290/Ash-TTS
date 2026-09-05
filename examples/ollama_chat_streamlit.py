@@ -2,11 +2,11 @@
 Streamlit chat interface with Ollama + TTS streaming.
 
 Usage:
-    streamlit run ollama_chat_streamlit.py
+    streamlit run examples/ollama_chat_streamlit.py
 
 Requires:
     - Ollama running on localhost:11434
-    - TTS backend running on localhost:8000 (python tts_backend.py)
+    - TTS backend running on localhost:8000 (python examples/tts_backend.py)
 """
 
 import streamlit as st
