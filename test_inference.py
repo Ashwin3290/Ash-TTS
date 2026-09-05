@@ -86,7 +86,7 @@ def main(utt_id, text, output_dir, hifi_ckpt=None):
     print(f"Device: {device}")
 
     # ckpt_path = pull_best_checkpoint()
-    ckpt_path = paths.fastspeech_ckpt_dir / "best_hf.pt"
+    ckpt_path = paths.fastspeech_ckpt_dir / "best_sil.pt"
     ckpt = torch.load(ckpt_path, map_location=device)
     print(f"Checkpoint step: {ckpt['step']}")
 
@@ -111,16 +111,20 @@ def main(utt_id, text, output_dir, hifi_ckpt=None):
         print(f"Custom text: {text}")
 
     vocab = load_phoneme_vocab()
-    phonemes = text_to_phonemes(text, vocab)
-    if not phonemes:
+    sentences = text_to_phonemes(text, vocab)
+    if not sentences:
         raise ValueError("Phonemization produced empty sequence.")
+    print(f"{len(sentences)} sentence(s), {sum(len(s) for s in sentences)} phonemes")
 
-    ph_tensor = torch.tensor(phonemes, dtype=torch.long).unsqueeze(0).to(device)
-    ph_lens = torch.tensor([len(phonemes)], dtype=torch.long).to(device)
+    pred_mels = []
+    for phonemes in sentences:
+        ph_tensor = torch.tensor(phonemes, dtype=torch.long).unsqueeze(0).to(device)
+        ph_lens = torch.tensor([len(phonemes)], dtype=torch.long).to(device)
 
-    with torch.no_grad():
-        _, mel_pred, _, _, _, mel_lens = model(ph_tensor, ph_lens)  # PostNet-refined mel_after
-    pred_mel = mel_pred[0, :mel_lens[0].item()].cpu().numpy()  # (T, 80), normalised
+        with torch.no_grad():
+            _, mel_pred, _, _, _, mel_lens = model(ph_tensor, ph_lens)  # PostNet-refined mel_after
+        pred_mels.append(mel_pred[0, :mel_lens[0].item()].cpu().numpy())  # (T, 80), normalised
+    pred_mel = np.concatenate(pred_mels, axis=0)
     print(f"Predicted mel frames: {pred_mel.shape[0]} "
           f"({pred_mel.shape[0] * acfg.hop_length / acfg.sample_rate:.2f}s)")
 

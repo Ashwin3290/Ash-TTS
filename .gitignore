@@ -241,3 +241,4 @@ do_universal
 /.overnight
 *.wav
 _hf_staging
+GAN_model/do_02500000

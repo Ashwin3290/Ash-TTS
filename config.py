@@ -122,7 +122,7 @@ class HiFiGANConfig:
     # raised from 25k after the fine-tune finished with its best at step 22k
     # (still improving at the ceiling); 50k also matches the official repo's
     # fine-tuning budget more closely
-    max_steps: int = 100_000
+    max_steps: int = 25000
     fp16: bool = True
 
     # audio segment for training — HiFi-GAN trains on fixed-length chunks, not full utterances
