@@ -3,7 +3,7 @@ FastAPI backend for TTS generation.
 Streamlit calls this to generate audio chunks.
 
 Usage:
-    python tts_backend.py        # starts on localhost:8000
+    python examples/tts_backend.py        # starts on localhost:8000
 """
 
 import os
@@ -16,8 +16,6 @@ if sys.platform == "win32":
     )
 
 import torch
-import json
-import numpy as np
 from pathlib import Path
 from io import BytesIO
 import base64
@@ -27,10 +25,11 @@ from pydantic import BaseModel
 from fastapi.responses import StreamingResponse
 import soundfile as sf
 
-from config import audio as acfg, hifigan as hcfg, paths
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))  # repo root, for the imports below
+from config import audio as acfg, hifigan as hcfg
 from model.fastspeech2 import FastSpeech2, load_fs2_state
 from vocoder.generator import Generator, config_from_hcfg
-from inference import text_to_phonemes, load_phoneme_vocab
+from inference import text_to_phonemes, load_phoneme_vocab, load_stats
 
 logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger(__name__)
@@ -74,10 +73,8 @@ def load_models():
     ensure_checkpoints()
     vocab = load_phoneme_vocab()
 
-    with open(paths.processed_dir / "stats.json") as f:
-        stats = json.load(f)
     fs2 = FastSpeech2().to(device)
-    fs2.variance_adaptor.set_stats(**stats)
+    fs2.variance_adaptor.set_stats(**load_stats())
     ckpt = torch.load(FS2_CKPT, map_location=device)
     load_fs2_state(fs2, ckpt["model"])
     fs2.eval()
@@ -111,7 +108,7 @@ def text_to_wav(text, speed=1.0, pitch=1.0, energy=1.0):
 
         logger.debug("Running FastSpeech2...")
         with torch.no_grad():
-            _, mel_pred, _, _, _, mel_lens = fs2(
+            mel_pred, _, _, _, mel_lens = fs2(
                 ph, ph_lens,
                 duration_scale=1.0 / speed,
                 pitch_scale=pitch,

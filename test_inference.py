@@ -39,7 +39,7 @@ from huggingface_hub import hf_hub_download
 
 from config import audio as acfg, paths
 from model.fastspeech2 import FastSpeech2, load_fs2_state
-from inference import (text_to_phonemes, load_phoneme_vocab, denorm_mel,
+from inference import (text_to_phonemes, load_phoneme_vocab, load_stats, denorm_mel,
                        load_postnet, load_vocoder, mel_to_wav)
 
 HF_CKPT_REPO = "Ashwin-C9/tts-fastspeech2-ckpt"
@@ -92,10 +92,8 @@ def main(utt_id, text, output_dir, fs2_ckpt=None, hifi_ckpt=None, postnet_ckpt=N
     ckpt = torch.load(ckpt_path, map_location=device)
     print(f"FastSpeech2: {ckpt_path} (step {ckpt.get('step', '?')})")
 
-    with open(paths.processed_dir / "stats.json") as f:
-        stats = json.load(f)
     model = FastSpeech2().to(device)
-    model.variance_adaptor.set_stats(**stats)
+    model.variance_adaptor.set_stats(**load_stats())
     load_fs2_state(model, ckpt["model"])
     model.eval()
 
@@ -125,7 +123,7 @@ def main(utt_id, text, output_dir, fs2_ckpt=None, hifi_ckpt=None, postnet_ckpt=N
         ph_tensor = torch.tensor(phonemes, dtype=torch.long).unsqueeze(0).to(device)
         ph_lens = torch.tensor([len(phonemes)], dtype=torch.long).to(device)
         with torch.no_grad():
-            _, mel_pred, _, _, _, mel_lens = model(ph_tensor, ph_lens)
+            mel_pred, _, _, _, mel_lens = model(ph_tensor, ph_lens)
             if postnet is not None:
                 mel_pred = mel_pred + postnet(mel_pred)
         mels.append(mel_pred[0, :mel_lens[0].item()].cpu().numpy())

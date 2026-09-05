@@ -51,15 +51,15 @@ class Decoder(nn.Module):
 class PostNet(nn.Module):
     """
     Tacotron2-style residual refiner: 5 Conv1d layers over the mel channel axis
-    predicting a residual that is ADDED to the decoder's mel output
-    (mel_after = mel_before + postnet(mel_before)).
+    predicting a residual that is ADDED to a FastSpeech2 mel output
+    (mel_refined = mel + postnet(mel)).
+
+    Trained standalone by train_postnet.py on FastSpeech2's own predicted mels
+    (see generate_mels.py), decoupled from the acoustic model itself. Applied
+    optionally at inference time (inference.py --postnet-ckpt).
 
     The final conv is zero-initialised, so a freshly constructed PostNet is an
-    exact identity (residual = 0). This means:
-      - checkpoints saved before the PostNet existed still load and produce
-        identical output (strict=False leaves the residual at zero), and
-      - warm-start fine-tuning begins from the backbone's converged operating
-        point instead of adding random noise to it.
+    exact identity (residual = 0).
     """
     def __init__(self):
         super().__init__()

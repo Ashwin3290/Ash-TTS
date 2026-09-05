@@ -26,16 +26,15 @@ if sys.platform == "win32":
         r"C:\Program Files\eSpeak NG\libespeak-ng.dll"
     )
 
-import json
 import numpy as np
 import torch
 import soundfile as sf
 from pathlib import Path
 
-from config import audio as acfg, hifigan as hcfg, paths
+from config import audio as acfg, hifigan as hcfg
 from model.fastspeech2 import FastSpeech2, load_fs2_state
 from vocoder.generator import Generator, config_from_hcfg
-from inference import text_to_phonemes, load_phoneme_vocab
+from inference import text_to_phonemes, load_phoneme_vocab, load_stats
 
 FS2_CKPT  = Path("checkpoints/fastspeech2/best.pt")
 HIFI_CKPT = Path("checkpoints/hifigan/g_best.pt")
@@ -55,10 +54,8 @@ def ensure_checkpoints():
 
 
 def load_models(device):
-    with open(paths.processed_dir / "stats.json") as f:
-        stats = json.load(f)
     fs2 = FastSpeech2().to(device)
-    fs2.variance_adaptor.set_stats(**stats)
+    fs2.variance_adaptor.set_stats(**load_stats())
     ckpt = torch.load(FS2_CKPT, map_location=device)
     load_fs2_state(fs2, ckpt["model"])
     fs2.eval()
@@ -82,7 +79,7 @@ def synthesize(text, fs2, hifi, vocab, device, speed=1.0, pitch=1.0, energy=1.0)
     ph_lens = torch.tensor([len(phonemes)], dtype=torch.long).to(device)
 
     with torch.no_grad():
-        _, mel_pred, _, _, _, mel_lens = fs2(   # mel_pred = PostNet-refined mel_after
+        mel_pred, _, _, _, mel_lens = fs2(
             ph, ph_lens,
             duration_scale=1.0 / speed,
             pitch_scale=pitch,

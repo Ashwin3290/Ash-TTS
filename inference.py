@@ -63,14 +63,29 @@ MAX_CHUNK_PHONEMES = 100
 CROSSFADE_SEC = 0.005
 
 
+def _resolve_asset(filename):
+    """assets/ (checked into git, ships with the repo) first, falling back to
+    data/processed/ (produced locally by preprocess.py) — so inference works
+    on a fresh clone with just the checkpoints, no dataset required."""
+    asset_path = paths.assets_dir / filename
+    if asset_path.exists():
+        return asset_path
+    processed_path = paths.processed_dir / filename
+    if processed_path.exists():
+        return processed_path
+    raise FileNotFoundError(
+        f"{filename} not found in {paths.assets_dir} or {paths.processed_dir}. "
+        "Run preprocess.py first."
+    )
+
+
 def load_phoneme_vocab():
-    vocab_path = paths.processed_dir / "phoneme_vocab.json"
-    if not vocab_path.exists():
-        raise FileNotFoundError(
-            f"Phoneme vocab not found at {vocab_path}. "
-            "Run preprocess.py first."
-        )
-    with open(vocab_path, encoding="utf-8") as f:
+    with open(_resolve_asset("phoneme_vocab.json"), encoding="utf-8") as f:
+        return json.load(f)
+
+
+def load_stats():
+    with open(_resolve_asset("stats.json"), encoding="utf-8") as f:
         return json.load(f)
 
 
@@ -212,8 +227,7 @@ def infer(text, fs2_ckpt, hifi_ckpt, output_path,
 
     fs2 = FastSpeech2().to(device)
     ckpt = torch.load(fs2_ckpt, map_location=device)
-    with open(paths.processed_dir / "stats.json") as f:
-        fs2.variance_adaptor.set_stats(**json.load(f))
+    fs2.variance_adaptor.set_stats(**load_stats())
     load_fs2_state(fs2, ckpt["model"])
     fs2.eval()
     print(f"FastSpeech2: {fs2_ckpt} (step {ckpt.get('step', '?')})")
@@ -227,7 +241,7 @@ def infer(text, fs2_ckpt, hifi_ckpt, output_path,
         ph_lens = torch.tensor([len(phonemes)], dtype=torch.long).to(device)
 
         with torch.no_grad():
-            _, mel_pred, _, _, _, mel_lens = fs2(
+            mel_pred, _, _, _, mel_lens = fs2(
                 ph_tensor, ph_lens,
                 duration_scale=1.0 / speed,   # slower speed = more frames per phoneme
                 pitch_scale=pitch,

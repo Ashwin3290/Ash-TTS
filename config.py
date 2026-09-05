@@ -85,18 +85,6 @@ class TrainFastSpeechConfig:
     save_every: int = 5000
     val_every: int = 1000
 
-    # PostNet warm-start (train_fastspeech.py --init): backbone stays frozen while
-    # the fresh PostNet trains, and unfreezes only once val mel_after L1 beats the
-    # frozen backbone's own mel_before L1 by the threshold below (metric-gated,
-    # not step-gated). max_freeze_steps is a safety cap in case the gate never
-    # triggers. After unfreezing, fine-tune everything at a flat low LR with a
-    # short linear re-warmup so the converged backbone isn't blown up by fresh
-    # optimizer state.
-    unfreeze_threshold: float = 0.98   # unfreeze when val_after <= baseline * this
-    max_freeze_steps: int = 30_000
-    finetune_lr: float = 1e-4
-    finetune_warmup: int = 2000
-
 
 @dataclass
 class HiFiGANConfig:
@@ -137,6 +125,7 @@ class HiFiGANConfig:
 class PathConfig:
     data_root: Path = Path("data/LJSpeech-1.1")
     processed_dir: Path = Path("data/processed")
+    assets_dir: Path = Path("assets")
     checkpoint_dir: Path = Path("checkpoints")
     fastspeech_ckpt_dir: Path = Path("checkpoints/fastspeech2")
     hifigan_ckpt_dir: Path = Path("checkpoints/hifigan")

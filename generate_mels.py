@@ -84,7 +84,7 @@ def main(ckpt_path, postnet_ckpt=None):
             ph_lens = torch.tensor([phonemes.size(1)], dtype=torch.long, device=device)
 
             # GT durations for frame alignment; pitch/energy left to the model
-            _, mel_pred, _, _, _, mel_lens = model(
+            mel_pred, _, _, _, mel_lens = model(
                 phonemes, ph_lens, durations_gt=durations,
                 f0_gt=None, energy_gt=None,
             )
