@@ -31,13 +31,13 @@ Optional control knobs (all default 1.0):
 
 import argparse
 import json
+import os
 import re
+import sys
 
 import numpy as np
 import soundfile as sf
 import torch
-import sys
-import os
 
 if sys.platform == "win32":
     os.environ.setdefault(
@@ -54,10 +54,13 @@ from vocoder.generator import Generator, config_from_hcfg
 SENTENCE_END = re.compile(r"(?<=[.!?])\s+")
 CLAUSE_BREAK = re.compile(r"[,;:]")
 
-# the acoustic model was trained on utterances under 10s (~860 frames); long
-# inputs run past both the positional-encoding buffer and anything the duration
-# predictor has seen, and the tail degrades. Chunk at <sil> boundaries instead.
-MAX_CHUNK_PHONEMES = 150
+# LJSpeech phoneme-sequence lengths: p50 70, p90 98, p99 113, max 132. Anything
+# past ~100 is territory the duration predictor and decoder attention barely saw,
+# and the tail of the chunk degrades. Cap at the p90.
+MAX_CHUNK_PHONEMES = 100
+
+# crossfade applied when joining chunks, in seconds
+CROSSFADE_SEC = 0.005
 
 
 def load_phoneme_vocab():
@@ -81,27 +84,20 @@ def denorm_mel(mel):
     return (mel + 1) / 2 * (acfg.mel_max - acfg.mel_min) + acfg.mel_min
 
 
-def chunk_by_sil(ids, sil_id, max_len=MAX_CHUNK_PHONEMES):
-    """Split a phoneme-id list into chunks of at most max_len, cutting only at
-    <sil> tokens so a chunk boundary always lands where a pause already is."""
-    if len(ids) <= max_len:
-        return [ids]
+def pack_chunks(units, max_len=MAX_CHUNK_PHONEMES):
+    """units: list of id-lists, one per word, some ending in <sil>.
 
-    clauses, buf = [], []
-    for i in ids:
-        buf.append(i)
-        if i == sil_id:
-            clauses.append(buf)
-            buf = []
-    if buf:
-        clauses.append(buf + [sil_id])
-
+    Greedily packs units into chunks of at most max_len ids. Because a unit is a
+    word, a chunk can break mid-clause when a clause is too long to split at a
+    pause — packing whole clauses only would let an unpunctuated run-on produce
+    a single oversized chunk regardless of max_len.
+    """
     chunks, cur = [], []
-    for clause in clauses:
-        if cur and len(cur) + len(clause) > max_len:
+    for unit in units:
+        if cur and len(cur) + len(unit) > max_len:
             chunks.append(cur)
             cur = []
-        cur += clause
+        cur += unit
     if cur:
         chunks.append(cur)
     return chunks
@@ -118,7 +114,7 @@ def text_to_phonemes(text, vocab):
     from phonemizer.separator import Separator
 
     backend = EspeakBackend("en-us", preserve_punctuation=False, with_stress=True)
-    # must match preprocess.py exactly: phone-level tokens, word marker stripped
+    # must match preprocess.py exactly: phone-level tokens, '|' marks word ends
     sep = Separator(phone=" ", word="| ", syllable="")
 
     sil_id = vocab["<sil>"]
@@ -133,16 +129,39 @@ def text_to_phonemes(text, vocab):
             continue
         ph_strs = backend.phonemize(clauses, separator=sep)
 
-        ids = []
-        for i, ph_str in enumerate(ph_strs):
-            ids += [vocab.get(p, pad_id)
-                    for p in ph_str.replace("|", "").split() if p.strip()]
-            if i < len(ph_strs) - 1:
-                ids.append(sil_id)
-        ids.append(sil_id)
-        chunks.extend(chunk_by_sil(ids, sil_id))
+        units = []
+        for ph_str in ph_strs:
+            for word in ph_str.split("|"):
+                ids = [vocab.get(p, pad_id) for p in word.split() if p.strip()]
+                if ids:
+                    units.append(ids)
+            if units:   # <sil> at every clause break and at the sentence end
+                units[-1] = units[-1] + [sil_id]
+        chunks.extend(pack_chunks(units))
 
     return chunks
+
+
+def join_wavs(wavs, sample_rate):
+    """Concatenate chunk waveforms with a short crossfade, so a chunk boundary
+    that fell mid-clause does not produce an audible click."""
+    if not wavs:
+        return np.zeros(0, dtype=np.float32)
+    if len(wavs) == 1:
+        return wavs[0]
+
+    xf = int(CROSSFADE_SEC * sample_rate)
+    out = wavs[0]
+    for nxt in wavs[1:]:
+        n = min(xf, len(out), len(nxt))
+        if n > 0:
+            ramp = np.linspace(0.0, 1.0, n, dtype=np.float32)
+            out = np.concatenate([out[:-n],
+                                  out[-n:] * (1 - ramp) + nxt[:n] * ramp,
+                                  nxt[n:]])
+        else:
+            out = np.concatenate([out, nxt])
+    return out
 
 
 def load_postnet(ckpt_path, device):
@@ -189,6 +208,7 @@ def infer(text, fs2_ckpt, hifi_ckpt, output_path,
     if not chunks:
         raise ValueError("Phonemization produced empty sequence.")
     print(f"{len(chunks)} chunk(s), {sum(len(c) for c in chunks)} phonemes total")
+    print(f"chunk lengths: {[len(c) for c in chunks]}")
 
     fs2 = FastSpeech2().to(device)
     ckpt = torch.load(fs2_ckpt, map_location=device)
@@ -219,7 +239,7 @@ def infer(text, fs2_ckpt, hifi_ckpt, output_path,
         mel = mel_pred[0, :mel_lens[0].item()].cpu().numpy()   # (T, 80), normalised
         wavs.append(mel_to_wav(denorm_mel(mel), hifi, device))
 
-    wav = np.concatenate(wavs)
+    wav = join_wavs(wavs, acfg.sample_rate)
     sf.write(output_path, wav, acfg.sample_rate)
     print(f"Saved {output_path}  ({len(wav) / acfg.sample_rate:.2f}s)")
 
