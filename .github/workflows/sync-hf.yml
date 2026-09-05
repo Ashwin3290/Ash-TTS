@@ -1,0 +1,45 @@
+name: Sync model card to HuggingFace
+
+# The model card is written once, in this repo, and mirrored to the HF model
+# repo's README on every change. Only the card is synced: weights change rarely
+# and an automated push of a 260 MB bundle is more risk than convenience.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - MODEL_CARD.md
+      - .github/workflows/sync-hf.yml
+  workflow_dispatch:
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - run: pip install huggingface_hub
+
+      - name: Upload MODEL_CARD.md as the model repo README
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          HF_MODEL_REPO: Ashwin-C9/ash-tts
+        run: |
+          python - <<'PY'
+          import os
+          from huggingface_hub import HfApi
+
+          api = HfApi(token=os.environ["HF_TOKEN"])
+          api.upload_file(
+              path_or_fileobj="MODEL_CARD.md",
+              path_in_repo="README.md",
+              repo_id=os.environ["HF_MODEL_REPO"],
+              repo_type="model",
+              commit_message=f"Sync model card from {os.environ['GITHUB_SHA'][:7]}",
+          )
+          print(f"Synced to {os.environ['HF_MODEL_REPO']}")
+          PY
